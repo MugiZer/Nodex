@@ -15,7 +15,7 @@ The system should feel like a real product, not a mock demo, even though the bui
 
 - Next.js App Router, TypeScript, Tailwind
 - Supabase (PostgreSQL + pgvector)
-- Anthropic `claude-sonnet-4-5` for all LLM calls
+- Anthropic `claude-sonnet-4-6` for all LLM calls
 - OpenAI `text-embedding-3-small` for embeddings only
 - React Flow for graph visualization
 - p5.js for interactive visuals
@@ -27,13 +27,13 @@ Version note:
 
 ## Absolute Rules
 
-- Use `claude-sonnet-4-5` for every Claude call
+- Use `claude-sonnet-4-6` for every Claude call
 - Every API route must have `try/catch` with descriptive error messages
 - Never return a 500 without a descriptive JSON error message
 - All code must be fully typed with TypeScript; no `any`
 - Never hardcode API keys; always use `process.env`
 - `console.log` progress at every pipeline step for debugging
-- Use `claude-sonnet-4-5` for all Claude model interactions without exception
+- Use `claude-sonnet-4-6` for all Claude model interactions without exception
 - Keep every server route defensive: descriptive JSON errors, not bare failures
 - Treat broken visuals as non-blocking; fallback must always preserve the learner flow
 - Use Supabase service-role credentials only on trusted server-side routes
@@ -90,7 +90,7 @@ Never leak service-role credentials into the client bundle.
 ## High-Level Warnings
 
 - This is not stock Next.js; read the relevant guides in `node_modules/next/dist/docs/` before writing code.
-- Use `claude-sonnet-4-5` for every Claude call with no exceptions.
+- Use `claude-sonnet-4-6` for every Claude call with no exceptions.
 - Every API route must have `try/catch` and must return descriptive JSON errors instead of bare 500s.
 - Keep all code fully typed in TypeScript; do not use `any`.
 - Never hardcode secrets; always read API keys and service credentials from environment variables.

@@ -10,7 +10,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "round2:smoke": "node scripts/round2-smoke.mjs",
-    "round2:smoke:strict": "node scripts/round2-smoke.mjs --strict-rpc"
+    "round2:smoke:strict": "node scripts/round2-smoke.mjs --strict-rpc",
+    "graph-route:summary": "node scripts/graph-route-summary.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.81.0",

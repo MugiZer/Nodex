@@ -43,7 +43,7 @@ It is a working index for the split context, not a replacement for the original 
 - `context/07-pack-domain-db-retrieval.md`
   - Domain Contract Pack, Database + Auth Pack, Retrieval + Caching + Regeneration Pack
 - `context/08-pack-orchestration-prompts-content.md`
-  - Generation Orchestration Pack, Prompt / Output-Schema Pack, Graph Content Rules Pack
+  - Generation Orchestration Pack, Prompt / Output-Schema Pack, Graph Content Rules Pack, and the pack-level LLM output guardrail philosophy
 - `context/09-pack-progress-frontend-ops.md`
   - Progress + Diagnostic + Unlock Pack, Frontend Contract Pack, Ops / Deployment / Logging / Tests / Acceptance Criteria Pack
 - `context/99-known-contradictions.md`

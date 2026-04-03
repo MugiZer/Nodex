@@ -1,10 +1,15 @@
 import Anthropic from "@anthropic-ai/sdk";
 
-import { requireServerEnv } from "@/lib/env";
+import { getOptionalEnv, requireServerEnv } from "@/lib/env";
 
-export const CLAUDE_MODEL = "claude-sonnet-4-5" as const;
+export const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6" as const;
+export const ANTHROPIC_MODEL_OVERRIDE_ENV = "ANTHROPIC_MODEL_OVERRIDE" as const;
 
 let anthropicClient: Anthropic | null = null;
+
+export function getAnthropicModel(): string {
+  return getOptionalEnv(ANTHROPIC_MODEL_OVERRIDE_ENV) ?? DEFAULT_CLAUDE_MODEL;
+}
 
 export function getAnthropicClient(): Anthropic {
   if (!anthropicClient) {

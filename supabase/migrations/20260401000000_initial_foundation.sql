@@ -31,6 +31,7 @@ create table if not exists public.nodes (
   visual_verified boolean not null default false,
   quiz_json jsonb,
   diagnostic_questions jsonb,
+  lesson_status text not null default 'pending' check (lesson_status in ('pending', 'ready', 'failed')),
   position integer not null check (position >= 0),
   attempt_count integer not null default 0,
   pass_count integer not null default 0,
@@ -67,10 +68,31 @@ create table if not exists public.user_progress (
 create index if not exists user_progress_user_graph_idx on public.user_progress (user_id, graph_version);
 create index if not exists user_progress_node_idx on public.user_progress (node_id);
 
+create table if not exists public.generation_curriculum_audits (
+  request_id text primary key,
+  request_fingerprint text not null,
+  subject text not null,
+  topic text not null,
+  audit_status text not null check (audit_status in ('accepted', 'skipped_timeout', 'skipped_contract_failure', 'disabled_async')),
+  outcome_bucket text not null check (outcome_bucket in ('accepted_clean', 'accepted_with_issues', 'skipped_timeout', 'skipped_contract_failure', 'disabled_async')),
+  attempt_count integer not null check (attempt_count >= 0),
+  failure_category text,
+  parse_error_summary text,
+  duration_ms integer not null check (duration_ms >= 0),
+  issue_count integer not null check (issue_count >= 0),
+  async_audit boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists generation_curriculum_audits_fingerprint_idx on public.generation_curriculum_audits (request_fingerprint);
+create index if not exists generation_curriculum_audits_status_idx on public.generation_curriculum_audits (audit_status);
+
 alter table public.graphs enable row level security;
 alter table public.nodes enable row level security;
 alter table public.edges enable row level security;
 alter table public.user_progress enable row level security;
+alter table public.generation_curriculum_audits enable row level security;
 
 create or replace function public.search_graph_candidates(
   p_subject text,
@@ -215,10 +237,121 @@ begin
 end;
 $$;
 
+create or replace function public.store_generated_graph(
+  p_graph jsonb,
+  p_nodes jsonb,
+  p_edges jsonb,
+  p_embedding text
+)
+returns table (graph_id uuid)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_graph_id uuid := coalesce(nullif(p_graph->>'id', '')::uuid, gen_random_uuid());
+  v_title text := p_graph->>'title';
+  v_subject text := p_graph->>'subject';
+  v_topic text := p_graph->>'topic';
+  v_description text := p_graph->>'description';
+  v_version integer := coalesce(nullif(p_graph->>'version', '')::integer, 1);
+  v_flagged boolean := coalesce(nullif(p_graph->>'flagged_for_review', '')::boolean, false);
+  v_created_at timestamptz := coalesce(nullif(p_graph->>'created_at', '')::timestamptz, now());
+begin
+  insert into public.graphs (
+    id,
+    title,
+    subject,
+    topic,
+    description,
+    embedding,
+    version,
+    flagged_for_review,
+    created_at
+  )
+  values (
+    v_graph_id,
+    v_title,
+    v_subject,
+    v_topic,
+    v_description,
+    p_embedding::vector,
+    v_version,
+    v_flagged,
+    v_created_at
+  );
+
+  insert into public.nodes (
+    id,
+    graph_id,
+    graph_version,
+    title,
+    lesson_text,
+    static_diagram,
+    p5_code,
+    visual_verified,
+    quiz_json,
+    diagnostic_questions,
+    lesson_status,
+    position,
+    attempt_count,
+    pass_count
+  )
+  select
+    node_row.id::uuid,
+    v_graph_id,
+    v_version,
+    node_row.title,
+    node_row.lesson_text,
+    node_row.static_diagram,
+    node_row.p5_code,
+    node_row.visual_verified,
+    node_row.quiz_json,
+    node_row.diagnostic_questions,
+    coalesce(node_row.lesson_status, 'pending'),
+    node_row.position,
+    coalesce(node_row.attempt_count, 0),
+    coalesce(node_row.pass_count, 0)
+  from jsonb_to_recordset(p_nodes) as node_row(
+    id text,
+    title text,
+    lesson_text text,
+    static_diagram text,
+    p5_code text,
+    visual_verified boolean,
+    quiz_json jsonb,
+    diagnostic_questions jsonb,
+    lesson_status text,
+    position integer,
+    attempt_count integer,
+    pass_count integer
+  );
+
+  insert into public.edges (
+    from_node_id,
+    to_node_id,
+    type
+  )
+  select
+    edge_row.from_node_id::uuid,
+    edge_row.to_node_id::uuid,
+    edge_row.type
+  from jsonb_to_recordset(p_edges) as edge_row(
+    from_node_id text,
+    to_node_id text,
+    type text
+  );
+
+  return query select v_graph_id;
+end;
+$$;
+
 revoke all on function public.search_graph_candidates(text, text, integer) from public;
 revoke all on function public.record_progress_attempt(uuid, uuid, uuid, integer, timestamptz) from public;
+revoke all on function public.store_generated_graph(jsonb, jsonb, jsonb, text) from public;
 
 grant execute on function public.search_graph_candidates(text, text, integer) to service_role;
 grant execute on function public.record_progress_attempt(uuid, uuid, uuid, integer, timestamptz) to service_role;
+grant execute on function public.store_generated_graph(jsonb, jsonb, jsonb, text) to service_role;
 
 commit;

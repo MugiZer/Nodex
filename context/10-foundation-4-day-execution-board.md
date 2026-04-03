@@ -164,7 +164,7 @@ All generation stages read/write a single typed `GenerationRunState` object.
 Minimum state fields:
 - request metadata and correlation IDs
 - raw prompt
-- canonicalized subject/topic/description
+- canonicalized subject/topic/description plus canonical semantic metadata, canonicalization source, candidate-confidence metadata, and canonicalization version
 - retrieval candidates and retrieval decision
 - selected execution path: cache hit or generate
 - generated graph draft
@@ -205,9 +205,12 @@ Context files:
 
 Rule:
 - one repair retry for normal schema/content failures
+- canonicalize uses a grounded hybrid lane, then deterministic normalization, and then one targeted repair call if the semantic draft is still invalid
 - no infinite loops
 - no silent retries
 - each retry logs why it happened
+- Live canary acceptance should key off stable public outputs (`subject`, `topic`, rendered `description`) or semantic-equivalent normalized metadata, not raw byte identity of the pre-render draft
+- Canonicalize logs should truncate invalid draft payloads and validation details to bounded structured summaries rather than dumping arbitrarily large raw content
 
 Context files:
 - `context/02-data-and-api.md`

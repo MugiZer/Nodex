@@ -501,9 +501,9 @@ Use these priorities in order:
 The lower-level contracts already fix the main retrieval decisions:
 
 - Embedded text contract
-  - Retrieval embeddings are built from the canonicalized `description` string only
-  - The stored graph retrieval surface is the persisted graph `embedding`, created from that canonical description
-  - The V1 embedding input template is exactly the raw canonical `description`, with no subject/topic prefix or wrapper text
+  - Retrieval embeddings are built from the rendered canonicalized `description` string only
+  - The stored graph retrieval surface is the persisted graph `embedding`, created from that rendered canonical description
+  - The V1 embedding input template is exactly the rendered canonical `description`, with no subject/topic prefix or wrapper text
 - Subject normalization
   - Retrieval uses canonicalized `subject` as a hard pre-filter
   - Retrieval does not cross canonical subjects
@@ -552,7 +552,7 @@ The lower-level contracts already fix the main retrieval decisions:
 - The embedding input is the canonicalized `description`.
 - This applies to both stored graph embeddings and incoming retrieval queries.
 - The retrieve route does not embed additional text fields in V1.
-- Exact template: the raw four-sentence canonical description string and nothing else.
+- Exact template: the rendered four-sentence canonical description string and nothing else.
 
 #### B. Subject Normalization
 

@@ -8,34 +8,48 @@ This file is the authoritative lower-level reference for pipeline sequencing, st
 2. `POST /api/generate/retrieve`
 3. If `graph_id` exists, return `{ graph_id, cached: true }`
 4. Otherwise call `POST /api/generate/graph`
-5. Then `POST /api/generate/lessons`
-6. Then `POST /api/generate/diagnostics`
-7. Then `POST /api/generate/visuals`
-8. Then `POST /api/generate/store`
-9. Return `{ graph_id, cached: false }`
+5. Then persist the reconciled graph skeleton through `POST /api/generate/store`
+6. Return `{ graph_id, cached: false }` as soon as the skeleton is stored
+7. Delegate `POST /api/generate/enrich` for the deterministic first node slice
+8. Enrich the selected nodes in bounded node-sized subcalls, preserving deterministic path selection while allowing a small fixed concurrency for execution
+9. Keep remaining nodes at `lesson_status = "pending"`
 
 ## Route Shape Snapshot
 
 - `POST /api/generate/canonicalize` returns `{ subject, topic, description }`
 - `POST /api/generate/retrieve` returns `{ graph_id }` or `{ graph_id: null }`
 - `POST /api/generate/graph` returns `{ nodes, edges }`
-- `POST /api/generate/lessons` returns nodes enriched with `lesson_text`, `quiz_json`, and `static_diagram`
-- `POST /api/generate/diagnostics` returns nodes enriched with `diagnostic_questions`
-- `POST /api/generate/visuals` returns nodes with `p5_code` and `visual_verified`
-- `POST /api/generate/store` returns `{ graph_id }`
+- `POST /api/generate/graph?debug=1` may return `{ nodes, edges, debug }` in development/test only
+- Debug output includes `request_id` plus validator issue counts, validator issue-key counts, reconciliation path telemetry, outcome buckets, curriculum audit status, an explicit synchronous placeholder marker for curriculum, and timings for graph-route troubleshooting
+- `GET /api/generate/graph/audit?request_id=...` returns the persisted detached curriculum audit record when available
+- Direct debug callers may provide explicit `prerequisites` and `downstream_topics` boundary fields; when present, they are used for deterministic boundary checks, and when absent the graph route does not try to reverse-engineer them from prose
+- `POST /api/generate/lessons` returns a stage result envelope whose `data` carries nodes enriched with `lesson_text`, `quiz_json`, and `static_diagram`
+- `POST /api/generate/diagnostics` returns a stage result envelope whose `data` carries nodes enriched with `diagnostic_questions`
+- `POST /api/generate/visuals` returns a stage result envelope whose `data` carries nodes with `p5_code` and `visual_verified`
+- `POST /api/generate/store` returns a stage result envelope whose `data` carries `{ graph_id, duplicate_of_graph_id?, write_mode, remapped_node_count, persisted_node_count, persisted_edge_count }`
+- `POST /api/generate/enrich` returns `{ graph_id, request_id, selected_node_ids, processed_node_ids, ready_node_ids, failed_node_ids, remaining_pending_node_ids }`
 - `POST /api/generate` returns `{ graph_id, cached }`
 - `GET /api/graph/[id]` returns `{ graph, nodes, edges, progress }`
 
-## Four-Agent Graph Pipeline
+## Graph Pipeline Ownership
 
-- Agent 1: Generator
-- Agent 2: Structure Validator
-- Agent 3: Curriculum Validator
-- Agent 4: Reconciler
+- Stage 1: Generator proposal
+- Stage 2: Deterministic structure validation
+- Stage 3: Bounded curriculum audit
+- Stage 4: Reconciler
 
-Each agent is a separate Claude call with only explicitly passed input and no hidden shared context.
-The validator calls are independent of each other, and the reconciler only sees the original graph plus both validator outputs.
+The generator, curriculum validator, and reconciler are isolated Claude calls with only explicitly passed input and no hidden shared context.
+Structure validation is server-owned deterministic code by default because graph mechanics, topology legality, and acceptance/rejection are truth-defining checks.
+If a future implementation adds a bounded model-assisted structure audit, its findings are advisory inputs that must still pass deterministic server validation before acceptance.
+The curriculum validator is an advisory audit rather than a truth-defining acceptance gate.
+Both graph-generation entrypoints launch that audit as a detached best-effort task after the synchronous graph path is already on track to complete, so curriculum never blocks graph delivery.
+The synchronous graph response uses a placeholder curriculum state that is explicitly marked as non-final.
+The detached audit has its own completion lifecycle, persisted audit record, and follow-on log event family.
+If it returns accepted findings in budget, the reconciler sees them alongside the deterministic structure output.
+If it times out or fails contract validation, the detached audit still records that failure class without changing synchronous graph acceptance.
+The curriculum validator and deterministic structure validation are independent, and the reconciler only sees the original graph plus both accepted validator outputs when those outputs are available synchronously.
 Every stage output is machine-validated before the next stage runs.
+The server may apply deterministic graph normalization and deterministic local repair before escalating to the LLM reconciler, as long as those steps remain mechanical and do not invent new topic content.
 
 ## Stage Ownership
 
@@ -43,7 +57,8 @@ Every stage output is machine-validated before the next stage runs.
 - `lessons` owns `lesson_text`, `quiz_json`, and `static_diagram`
 - `diagnostics` owns `diagnostic_questions`
 - `visuals` owns `p5_code` and `visual_verified`
-- `store` persists only after all required node artifacts are present
+- `store` persists the skeleton immediately after reconciliation and later persists per-node enrichment updates against the stored node UUIDs
+- Stages 7 through 10 must emit one shared typed result envelope with searchable `code`, broad `category`, `retryable`, and structured `details` on failure, plus warnings for non-blocking conditions such as visual fallback
 
 ## Retrieval and Cache Behavior
 

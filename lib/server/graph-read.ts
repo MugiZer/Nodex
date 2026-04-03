@@ -66,7 +66,7 @@ export async function loadGraphPayload(
   const { data: nodeRows, error: nodeError } = await client
     .from("nodes")
     .select(
-      "id,graph_id,graph_version,title,lesson_text,static_diagram,p5_code,visual_verified,quiz_json,diagnostic_questions,position,attempt_count,pass_count",
+      "id,graph_id,graph_version,title,lesson_text,static_diagram,p5_code,visual_verified,quiz_json,diagnostic_questions,lesson_status,position,attempt_count,pass_count",
     )
     .eq("graph_id", graph.id)
     .order("position", { ascending: true })
