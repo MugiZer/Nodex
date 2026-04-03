@@ -23,6 +23,10 @@ function getEnvValue(name: string): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+export function getOptionalEnv(name: string): string | undefined {
+  return getEnvValue(name);
+}
+
 export function requireServerEnv(name: RequiredServerEnvKey): string {
   const value = getEnvValue(name);
   if (!value) {

@@ -21,7 +21,7 @@ Authority rule for this file:
 - orchestration should use shared server functions, not internal HTTP calls
 - the four graph agents are isolated Claude calls
 - validation and repair happen before the next stage runs
-- persistence happens only after the full successful pipeline
+- persistence begins with a reconciled skeleton write, then selected nodes are enriched incrementally
 - failures must be classified and surfaced with descriptive errors
 - duplicate generation needs a practical safeguard
 - logging must happen at every major milestone
@@ -31,7 +31,8 @@ Authority rule for this file:
 Foundation:
 
 - receives a learner prompt
-- canonicalizes it into `{subject, topic, description}`
+- canonicalizes it into a structured semantic draft that the server resolves to public `{subject, topic, description}`
+- uses a grounded hybrid canonicalization lane so inventory-covered ambiguous prompts can be resolved deterministically before or alongside the model
 - attempts retrieval against stored graphs
 - if retrieval hits, returns a cached graph
 - otherwise runs the graph-generation pipeline:
@@ -96,30 +97,33 @@ The following Pack 4 decisions are fixed in this split context and are no longer
   1. canonicalize
   2. retrieve
   3. graph generator
-  4. structure validator and curriculum validator in parallel
+  4. structure validator synchronously, curriculum validator as a detached best-effort audit
   5. reconciler
   6. lessons
   7. diagnostics
   8. visuals
   9. store
 - Retrieval short-circuits the generation path on a valid cache hit.
-- The validator calls are the only graph-stage parallelism explicitly approved here.
+- The validator calls are the only graph-stage concurrency explicitly approved here, and curriculum concurrency is non-blocking.
 - Lessons, diagnostics, and visuals run after reconciliation because they operate on the final graph.
 - Diagnostics runs before visuals, matching the lower-level pipeline contract.
 
 #### C. Retry policy
 
-- LLM-backed stages use a maximum of one retry with identical input after a parse, schema, or invariant-validation failure.
-- This applies to canonicalize, graph generator, structure validator, curriculum validator, reconciler, diagnostics, and visuals because their lower-level contracts already define JSON-only validation and one retry.
+- LLM-backed stages use a maximum of one bounded repair attempt after a parse, schema, or invariant-validation failure.
+- Canonicalize is special-cased: first apply grounded inventory candidate selection, then normalize locally, then use one targeted repair call with the original prompt, invalid draft, validation failures, and any active grounded candidate set if normalization still leaves the semantic draft invalid.
+- Graph generator, structure validator, reconciler, diagnostics, visuals, and lessons keep the existing one-retry baseline after invalid JSON or contract failure.
+- Curriculum validator may still use bounded repair internally, but it runs as a detached advisory audit and its failure must not block graph delivery.
 - Lessons follows the same pack-level baseline: one retry with identical input after invalid JSON or contract failure.
 - Retrieval and store are not given semantic regeneration retries here; operational transient retries, if any, belong to the later ops pack rather than this content/orchestration contract.
 
 #### D. Repair policy
 
 - Every stage output is machine-validated before the next stage runs.
-- The baseline repair depth is one retry with identical input; there is no separate free-form repair prompt established in V1 for Packs 4-6.
-- If the first attempt fails validation, retry once with the same input.
-- If the second attempt fails validation, abort the pipeline with a descriptive error.
+- Canonicalize uses deterministic local normalization before any repair call.
+- If canonicalize still fails after normalization, issue one targeted repair call instead of a blind identical retry.
+- Non-canonicalize stages keep the one-retry repair depth with the same input.
+- If the repair path fails, abort the pipeline with a descriptive error.
 - Visual downgrade to `visual_verified: false` with fallback to `static_diagram` is a valid success case, not a repair failure.
 
 #### E. Timeout policy
@@ -134,7 +138,8 @@ The following Pack 4 decisions are fixed in this split context and are no longer
 
 - If canonicalize returns `{"error":"NOT_A_LEARNING_REQUEST"}`, stop immediately and do not proceed.
 - If retrieval returns a usable cached graph, stop generation and return the cache hit.
-- If graph generation, either validator, or reconciliation fails, abort the generation path and persist nothing.
+- If graph generation, deterministic structure validation, or reconciliation fails, abort the generation path and persist nothing.
+- If curriculum validation times out or fails, log the skipped advisory audit, continue with an accepted empty curriculum issue set in the synchronous response, and allow the detached audit to finish for telemetry if it can.
 - If lessons fails, abort and persist nothing because `lesson_text`, `quiz_json`, and `static_diagram` are required artifacts.
 - If diagnostics fails, abort and persist nothing because `diagnostic_questions` are required artifacts for adaptive placement.
 - If visuals succeeds by marking a node `visual_verified: false`, that node degrades gracefully to `static_diagram`; this is the normal fallback path.
@@ -144,10 +149,10 @@ The following Pack 4 decisions are fixed in this split context and are no longer
 
 #### G. Persistence boundary
 
-- Persistence begins only after the final graph, lessons, diagnostics, and visuals payloads are complete and validated.
-- Nothing is written to Supabase before the full required artifact set exists.
-- Partially generated graphs are not stored.
-- Failure artifacts are logged, not persisted as partial graph rows.
+- Persistence begins immediately after reconciliation with a graph skeleton write.
+- The first write stores graph, nodes, and edges with nullable node content plus `lesson_status = "pending"`.
+- Incremental node updates then fill in lesson, diagnostic, and visual artifacts one node at a time for the selected initial slice.
+- Failure artifacts are logged, and failed nodes remain explicitly marked `lesson_status = "failed"` rather than pretending the graph is fully ready.
 
 #### H. Duplicate generation safeguards
 
@@ -354,7 +359,7 @@ Produce the final Generation Orchestration Pack now.
 
 Foundation:
 
-- canonicalizes a learner prompt into `{subject, topic, description}`
+- canonicalizes a learner prompt into a structured draft and resolves it to `{subject, topic, description}`
 - retrieves or generates a shared, versioned knowledge graph
 - generates the graph through a four-agent isolated pipeline:
   1. graph generator
@@ -441,7 +446,7 @@ The following Pack 5 decisions are fixed in this split context and are no longer
 
 #### B. Model settings baseline
 
-- Every LLM call in these packs uses `claude-sonnet-4-5`.
+- Every LLM call in these packs uses `claude-sonnet-4-6`.
 - OpenAI is reserved for embeddings only and does not generate pack content.
 - All stage outputs are raw JSON only with no markdown fences or prose outside schema.
 - Tool use is not part of the default stage contract.
@@ -451,7 +456,8 @@ The following Pack 5 decisions are fixed in this split context and are no longer
 
 #### C. Isolation rules
 
-- canonicalize sees only the learner prompt.
+- canonicalize sees only the learner prompt on the first pass and may additionally see the invalid draft plus validation failures on its one targeted repair pass.
+- Canonicalize returns resolved semantic metadata into orchestration state, including canonicalization source and grounded-candidate metadata, but Phase 1 downstream stage inputs stay on public `subject`, `topic`, and `description`.
 - graph_generator sees only `subject`, `topic`, and `description`.
 - structure_validator sees `subject`, `topic`, `description`, `nodes`, and `edges`; it does not see generator reasoning or curriculum-validator output.
 - curriculum_validator sees `subject`, `topic`, `description`, `nodes`, and `edges`; it does not see structure-validator output.
@@ -492,15 +498,17 @@ The following Pack 5 decisions are fixed in this split context and are no longer
 
 #### G. Repair philosophy
 
-- The default repair path is one retry with identical input after parse or schema failure.
-- No extra repair-stage prompt is introduced for V1 in this pack.
+- Canonicalize is the only stage with a dedicated repair prompt in V1.
+- Its default repair path is local normalization first and one targeted repair call only when normalization still fails.
+- Local canonicalize normalization is formatting-safe only; it must not invent missing semantic content or rewrite topic scope.
+- All other stages keep the one identical-input retry baseline after parse or schema failure.
 - Stages that produce required artifacts fail hard when the retry path is exhausted.
 - Visual generation may degrade from interactive output to static-only fallback by returning `visual_verified: false`; that downgrade is success, not failure.
 - Canonicalize may terminate early with `NOT_A_LEARNING_REQUEST`, which is also a valid terminal outcome rather than a repair failure.
 
 #### Fixed model-settings baseline
 
-- Use `claude-sonnet-4-5` for every LLM stage in V1.
+- Use `claude-sonnet-4-6` for every LLM stage in V1.
 - Use JSON-only responses and constrained decoding when available.
 - Temperature baseline:
   - `0.0` for `canonicalize`, `structure_validator`, `curriculum_validator`, and `reconciler`
@@ -510,6 +518,72 @@ The following Pack 5 decisions are fixed in this split context and are no longer
   - validators: medium output budget sized for issue arrays
   - generator / reconciler / lessons / diagnostics / visuals: medium-high output budget sized to the schema, but never "unbounded"
 - Lessons run graph-wide in one stage call in V1 rather than one node per request or ad hoc batching.
+
+#### H. LLM Output Guardrail Philosophy
+
+- Treat LLMs as bounded proposal engines, not as authorities over system truth.
+- Every LLM-backed stage must have:
+  - a typed input contract
+  - a typed output contract
+  - deterministic server-side validation before its output is accepted
+- No raw model output may directly become:
+  - canonical ids
+  - persisted graph rows
+  - persisted node or edge rows
+  - learner progression state
+  - unlock state
+  - mastery state
+  - any other durable system truth
+- Deterministic code owns:
+  - validation
+  - acceptance and rejection
+  - identity resolution
+  - canonicalization of public output shape
+  - graph topology normalization
+  - progression gating
+  - persistence decisions
+- Model freedom must decrease as a stage gets closer to:
+  - persistence
+  - learner-state mutation
+  - public API truth
+- Closed sets are preferred over open generation wherever practical:
+  - fixed enums
+  - fixed edge types
+  - fixed node id patterns
+  - fixed status values
+- If a stage can be implemented deterministically in code, do it in code instead of prompting for it.
+- The model should be used only for the smallest genuinely uncertain step:
+  - semantic interpretation
+  - bounded graph proposal
+  - curriculum judgment
+  - concise content generation
+- Truth-defining stages must fail closed.
+- Every truth-defining stage must support one of these deterministic outcomes:
+  - accepted
+  - rejected
+  - terminal special-case outcome explicitly defined by contract, such as `NOT_A_LEARNING_REQUEST`
+- Validation is part of the architecture, not cleanup after generation.
+- The authoritative post-model pipeline shape is:
+  - deterministic preprocessing
+  - bounded LLM proposal
+  - shape validation
+  - semantic validation
+  - state validation
+  - optional local normalization if the normalization is semantics-preserving
+  - at most one bounded repair pass when the stage contract allows it
+  - accept or fail descriptively
+- Local normalization may repair formatting-safe or server-owned fields, but it must not invent missing semantic content.
+- In V1, server-owned fields include any field whose correctness is better derived deterministically than guessed by the model.
+- Current examples of server-owned or server-normalized fields include:
+  - accepted validator `valid` status, derived from `issues.length`
+  - graph node `position`, derived from the final hard-edge DAG
+  - route acceptance or rejection after schema and invariant checks
+- Creativity is allowed in proposal stages, not in persistence authority.
+- The generator may propose interesting decompositions, titles, and relationships within contract.
+- The server decides whether those proposals are structurally legal, in scope, non-duplicative, and safe to persist.
+- Token budget should be spent on ambiguity the code cannot resolve, not on re-asking the model to rediscover rules already encoded in code.
+- Retries are bounded. The default for LLM-backed stages is at most one retry or one targeted repair pass as fixed elsewhere in this file.
+- If a stage still fails deterministic validation after its allowed repair depth, the pipeline must fail descriptively instead of coercing or silently persisting the output.
 
 ### Output Requirements
 

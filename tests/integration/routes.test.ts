@@ -27,6 +27,9 @@ import {
   handleGraphReadRequest,
 } from "@/app/api/graph/[id]/route";
 import {
+  handleGraphCurriculumAuditReadRequest,
+} from "@/app/api/generate/graph/audit/route";
+import {
   handleProgressWriteRequest,
 } from "@/app/api/progress/route";
 
@@ -127,6 +130,42 @@ describe("Round 2 route integration", () => {
 
     expect(response.status).toBe(200);
     expect(graphPayloadSchema.parse(await response.json())).toEqual(payload);
+  });
+
+  it("returns a persisted curriculum audit record by request id", async () => {
+    const response = await handleGraphCurriculumAuditReadRequest(
+      new Request("http://localhost/api/generate/graph/audit?request_id=day2-success-trace"),
+      {
+        curriculumAuditDependencies: {
+          fetchAuditResult: async () => ({
+            request_id: "day2-success-trace",
+            request_fingerprint: "fingerprint-1",
+            subject: "mathematics",
+            topic: "trigonometry",
+            audit_status: "accepted",
+            outcome_bucket: "accepted_clean",
+            attempt_count: 1,
+            failure_category: null,
+            parse_error_summary: null,
+            duration_ms: 1234,
+            issue_count: 0,
+            async_audit: true,
+            created_at: "2026-04-01T12:00:00.000Z",
+            updated_at: "2026-04-01T12:00:01.000Z",
+          }),
+        },
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      request_id: "day2-success-trace",
+      audit: {
+        request_id: "day2-success-trace",
+        audit_status: "accepted",
+        outcome_bucket: "accepted_clean",
+      },
+    });
   });
 
   it("applies progress pass/fail semantics and unlock updates", async () => {

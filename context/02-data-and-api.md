@@ -27,7 +27,7 @@ If a higher-level pack file still reopens a decision covered here, this file win
 ### Retrieval
 
 - Retrieval uses canonical `subject` as a hard pre-filter
-- Retrieval uses the canonicalized `description` as the semantic embedding input
+- Retrieval uses the rendered canonicalized `description` as the semantic embedding input
 - Retrieval does not cross canonical subjects
 - Topic is metadata for canonicalization and generation, not part of the current retrieve route contract
 - Retrieval uses a strict accept/reject threshold of `0.85`
@@ -169,7 +169,7 @@ Notes:
 - Every failure path must return a descriptive JSON error
 - Never return a bare `500`
 - Keep all API payloads fully typed
-- Validate and retry malformed LLM output once before failing
+- Validate LLM output and apply stage-specific bounded repair before failing
 - Use descriptive error messages for parse, schema, and invariant failures
 - Server routes must not hardcode secrets or service keys
 
@@ -178,11 +178,21 @@ Notes:
 - Input: `{ prompt: string }`
 - Output: `{ subject: string, topic: string, description: string }`
 - Error path: if the prompt is not a learning request, surface `{"error":"NOT_A_LEARNING_REQUEST"}`
-- Server-side validation checks the returned JSON shape before proceeding
+- The public success payload remains `{ subject, topic, description }`
+- The model does not author `description` directly in V1. It returns a structured semantic draft that the server normalizes and renders into the public `description`
+- Canonicalize now uses a grounded hybrid policy:
+  - inventory-covered broad or high-volume prompts may resolve directly to an approved canonical starter topic without a model call
+  - medium-confidence inventory matches constrain the model to an approved candidate topic set
+  - long-tail or low-confidence prompts stay model-led
+- Server-side validation checks the model draft shape, normalized semantic fields, and the rendered public success shape before proceeding
 - `subject` must be allowed, including `general`
 - `topic` must be lowercase with underscores only
-- `description` must follow the exact four-sentence contract
+- Inventory-covered broad or underspecified prompts such as `calculus` are narrowed deterministically to the approved self-directed starter topic; prompts outside that grounded inventory still rely on the canonicalize model pass
+- `description` must follow the exact four-sentence contract, but that contract is enforced on the rendered server output rather than on raw model prose
 - The description is also used for semantic retrieval, so it must describe the topic boundary clearly
+- Canonicalize uses deterministic local normalization first and one targeted repair call only when the semantic draft is still invalid after normalization
+- Safe local canonicalize normalization is limited to trimming, whitespace collapse, trailing-punctuation stripping, topic slug normalization, empty-item dropping, and dedupe while preserving first-seen order
+- Internal canonicalization metadata must include `canonicalization_source`, `inventory_candidate_topics`, `candidate_confidence_band`, and `canonicalization_version`
 
 ### `POST /api/generate/retrieve`
 
@@ -202,39 +212,50 @@ Notes:
 - Output: `{ nodes: Node[], edges: Edge[] }`
 - This is the four-agent graph pipeline entry point
 - The response must satisfy structural invariants before later stages run
+- Curriculum auditing is detached and advisory on this route; it must not block graph acceptance
+- Debug mode may surface a synchronous placeholder audit state plus the request id for follow-up lookup
+
+### `GET /api/generate/graph/audit`
+
+- Input: `request_id` query parameter
+- Output: persisted detached curriculum audit record or `null`
+- This route is for operator/debug inspection of the async curriculum audit lifecycle
 
 ### `POST /api/generate/lessons`
 
-- Input: `{ nodes: Node[] }`
-- Output: `{ nodes: Node[] }`
+- Input: `{ subject: string, topic: string, description: string, nodes: NodeDraft[], edges: Edge[] }`
+- Output: shared stage result envelope with `stage: "lessons"` and `data: { nodes: LessonArtifact[] }`
 - This route enriches nodes with `lesson_text`, `quiz_json`, and `static_diagram`
 - Lesson content should remain self-contained relative to the node's hard prerequisites
 - `static_diagram` is owned by this route as the non-interactive fallback artifact
 
 ### `POST /api/generate/diagnostics`
 
-- Input: `{ nodes: Node[], edges: Edge[] }`
-- Output: `{ nodes: Node[] }`
+- Input: `{ subject: string, topic: string, description: string, nodes: LessonEnrichedNode[], edges: Edge[] }`
+- Output: shared stage result envelope with `stage: "diagnostics"` and `data: { nodes: DiagnosticArtifact[] }`
 - This route enriches nodes with `diagnostic_questions`
 - Diagnostic questions are generated server-side and stored on nodes
 - Diagnostic question generation is distinct from client-side diagnostic scoring
 
 ### `POST /api/generate/visuals`
 
-- Input: `{ nodes: Node[] }`
-- Output: `{ nodes: Node[] }`
+- Input: `{ subject: string, topic: string, description: string, nodes: DiagnosticEnrichedNode[], edges: Edge[] }`
+- Output: shared stage result envelope with `stage: "visuals"` and `data: { nodes: VisualArtifact[] }`
 - This route enriches nodes with `p5_code` and `visual_verified`
 - If a faithful interactive sketch is not likely to work, return empty `p5_code` and `visual_verified: false`
+- Visual fallback is a successful route outcome recorded as warnings, not a hard failure
 
 ### `POST /api/generate/store`
 
 - Input: `{ graph: Graph, nodes: Node[], edges: Edge[] }`
-- Output: `{ graph_id: string }`
-- This route saves the final graph and associated artifacts to Supabase
-- Store should only happen after graph, lesson, diagnostic, and visual artifacts are valid enough to serve
+- Output: shared stage result envelope with `stage: "store"` and `data: { graph_id, duplicate_of_graph_id?, write_mode, remapped_node_count, persisted_node_count, persisted_edge_count }`
+- This route saves either a graph skeleton or a fully enriched graph payload to Supabase
+- Skeleton writes persist nodes with `lesson_text = null`, `static_diagram = null`, `quiz_json = null`, `diagnostic_questions = null`, `p5_code = null`, `visual_verified = false`, and `lesson_status = "pending"`
+- Final node updates happen after skeleton persistence against the already-remapped persisted node UUIDs and must not remap ids a second time
 - The store step should use the service-role key on trusted server routes only
 - Store must remap all generation-time temporary node ids such as `node_1` to persisted node UUIDs before writing final node artifacts
 - Store must rewrite embedded self-references that contain node ids, including `diagnostic_questions[].node_id`, so persisted payloads never leak temporary generation ids
+- Every stage result envelope must carry `request_id`, `stage`, `duration_ms`, `attempts`, `warnings`, and structured `error` details when `ok` is false
 
 ### `POST /api/generate`
 
@@ -242,12 +263,13 @@ Notes:
 - Output: `{ graph_id: string, cached: boolean }`
 - Master orchestrator: canonicalize -> retrieve -> generate or cache-hit return
 - A cache hit must short-circuit the rest of the pipeline
-- A miss must proceed through graph generation, lessons, diagnostics, visuals, and store
+- A miss must proceed through graph generation, skeleton store, early `graph_id` return, and delegated incremental enrichment for the initial node slice
 
 ### `GET /api/graph/[id]`
 
 - Output: `{ graph: Graph, nodes: Node[], edges: Edge[], progress: UserProgress[] }`
 - Graph fetch includes the learner progress view alongside graph content
+- Each node payload includes `lesson_status` and may legitimately contain nullable content while `lesson_status = "pending"`
 - `progress` means the current authenticated learner's progress rows for that graph version only
 - The route must never return progress rows belonging to other learners
 

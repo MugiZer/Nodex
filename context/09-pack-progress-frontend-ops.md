@@ -366,6 +366,13 @@ These pages fetch initial route data on the server and pass interactive data int
 - `edges`
 - `progress`
 
+Incremental payload rule:
+
+- every node includes `lesson_status`
+- `pending`, `ready`, and `failed` are distinct server-truth states
+- pending nodes may legally have null lesson/quiz/diagnostic/visual fields
+- polling repeated `GET /api/graph/[id]` requests is the default V1 way to observe readiness transitions
+
 V1 policy:
 
 - fetch graph content and progress together
@@ -486,7 +493,8 @@ After the learner submits a prompt from `app/page.tsx`:
 
 1. show a loading state immediately
 2. call `POST /api/generate`
-3. display simple stage-oriented messages during a miss path
+3. navigate once a real `graph_id` is returned
+4. poll `GET /api/graph/[id]` for pending -> ready transitions during a miss path
 
 Recommended stage messages:
 
@@ -605,6 +613,10 @@ Define the V1 operational contract for:
   - stage durations
   - cache hit vs generation path
   - final graph id on success
+  - synchronous curriculum placeholder state when the graph route detaches curriculum auditing
+- Detached curriculum audits should log as their own event family with attempt count, failure category, outcome bucket, parse-error summary, and persisted request fingerprint.
+- Store/write failures for detached curriculum audits should be logged separately from the audit result classification so operators can distinguish generation failure from persistence failure.
+- The persisted audit record should be inspectable by `request_id` through the dedicated graph-audit read route.
 - Progress updates should log:
   - request id
   - graph id
@@ -633,6 +645,8 @@ Define the V1 operational contract for:
   - visuals
 - That is 8 primary LLM calls before retries.
 - With one retry per failing stage, the system should still remain below a demo-safe cost envelope; do not introduce additional speculative LLM passes in V1.
+- Detached curriculum audits should default to a single attempt and never repeat the same malformed JSON response just because the shared stage helper would otherwise retry.
+- Detached curriculum audits should not use the same retry semantics as synchronous gate stages unless a dedicated repair prompt is introduced.
 - Log cache hits vs misses and approximate generation path cost drivers at a coarse level.
 
 ### Resilience / Rate-Limit / Transient Failure Rules
@@ -805,6 +819,7 @@ Required milestones:
 - canonicalize start/success/failure
 - retrieve start/success/failure
 - graph generation start/success/failure
+- detached curriculum audit start/success/failure
 - lessons start/success/failure
 - diagnostics start/success/failure
 - visuals start/success/failure
@@ -827,13 +842,14 @@ Target latency:
 - cache-hit target: under 2 seconds end-to-end
 - full-generation target: under 45 seconds on the happy path
 - maximum acceptable demo latency: 90 seconds before the experience is considered degraded
+- detached curriculum audits should remain best-effort and must not block graph acceptance
 
 Batching policy:
 
 - graph generation remains one four-agent pipeline
-- lessons should be generated in one whole-graph pass or a small number of bounded batches, not one remote call per node in V1
-- diagnostics should be generated in one whole-graph pass
-- visuals should be generated in one whole-graph pass or bounded batches, not an unbounded per-node fan-out
+- lessons should be generated through bounded node-sized subcalls with a small fixed concurrency, not a single oversized whole-graph response and not an unbounded fan-out
+- diagnostics should use the same bounded node-sized execution model with a small fixed concurrency
+- visuals should use the same bounded node-sized execution model with a small fixed concurrency
 
 LLM call budget:
 

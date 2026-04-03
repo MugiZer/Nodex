@@ -1,4 +1,6 @@
 import type {
+  CanonicalizeModelSuccessDraft,
+  CanonicalizeResolvedSuccess,
   CanonicalizeSuccess,
   Edge,
   Graph,
@@ -24,7 +26,51 @@ export const canonicalizeSuccessFixture: CanonicalizeSuccess = {
   subject: "mathematics",
   topic: "trigonometry",
   description:
-    "Trigonometry is the study of relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle. It encompasses sine, cosine, tangent, trigonometric identities, the laws of sines and cosines, radian measure, and unit-circle reasoning. It assumes prior knowledge of algebra and Euclidean geometry and serves as a foundation for calculus and physics. Within mathematics, it is typically encountered at the intermediate level.",
+    "Trigonometry is the study of relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle. It encompasses sine, cosine, tangent, trigonometric identities, the laws of sines and cosines, radian measure, and unit-circle reasoning. It assumes prior knowledge of algebra and Euclidean geometry and serves as a foundation for calculus, physics, and statistics. Within mathematics, it is typically encountered at the intermediate level.",
+};
+
+export const canonicalizeModelDraftFixture: CanonicalizeModelSuccessDraft = {
+  subject: "mathematics",
+  topic: "Trigonometry",
+  scope_summary:
+    "relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle",
+  core_concepts: [
+    "sine",
+    "cosine",
+    "tangent",
+    "trigonometric identities",
+    "laws of sines and cosines",
+    "radian measure",
+    "unit-circle reasoning",
+  ],
+  prerequisites: ["algebra", "Euclidean geometry"],
+  downstream_topics: ["calculus", "physics", "statistics"],
+  level: "intermediate",
+};
+
+export const canonicalizeResolvedFixture: CanonicalizeResolvedSuccess = {
+  subject: "mathematics",
+  topic: "trigonometry",
+  description:
+    "Trigonometry is the study of relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle. It encompasses sine, cosine, tangent, trigonometric identities, laws of sines and cosines, radian measure, unit-circle reasoning. It assumes prior knowledge of algebra, Euclidean geometry and serves as a foundation for calculus, physics, and statistics. Within mathematics, it is typically encountered at the intermediate level.",
+  scope_summary:
+    "relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle",
+  core_concepts: [
+    "sine",
+    "cosine",
+    "tangent",
+    "trigonometric identities",
+    "laws of sines and cosines",
+    "radian measure",
+    "unit-circle reasoning",
+  ],
+  prerequisites: ["algebra", "Euclidean geometry"],
+  downstream_topics: ["calculus", "physics", "statistics"],
+  level: "intermediate",
+  canonicalization_source: "model_only",
+  inventory_candidate_topics: [],
+  candidate_confidence_band: "none",
+  canonicalization_version: "v3_grounded_hybrid_structured_rendered_description",
 };
 
 export const canonicalizePromptFixture = "I want to learn trigonometry";
@@ -92,6 +138,7 @@ export const baseNodesFixture: Node[] = [
     diagnostic_questions: [
       diagnosticItem(NODE_1_ID, "Which unit is used for angles in calculus?", 1),
     ],
+    lesson_status: "ready",
     position: 0,
     attempt_count: 0,
     pass_count: 0,
@@ -113,6 +160,7 @@ export const baseNodesFixture: Node[] = [
     diagnostic_questions: [
       diagnosticItem(NODE_2_ID, "Which function maps to the y-coordinate on the unit circle?", 2),
     ],
+    lesson_status: "ready",
     position: 1,
     attempt_count: 0,
     pass_count: 0,
@@ -134,6 +182,7 @@ export const baseNodesFixture: Node[] = [
     diagnostic_questions: [
       diagnosticItem(NODE_3_ID, "Which identity is foundational for trig simplification?", 3),
     ],
+    lesson_status: "ready",
     position: 2,
     attempt_count: 0,
     pass_count: 0,

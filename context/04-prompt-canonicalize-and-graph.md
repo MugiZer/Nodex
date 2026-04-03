@@ -6,19 +6,28 @@ This file captures the earliest model contracts from `AGENTS.md` in a single pla
 
 ### Purpose
 
-Turn a raw learner request into a canonical `{ subject, topic, description }` object, or return exactly `{"error":"NOT_A_LEARNING_REQUEST"}` when the input is not a learning request.
+Turn a raw learner request into a canonical result whose public route surface is `{ subject, topic, description }`, or return exactly `{"error":"NOT_A_LEARNING_REQUEST"}` when the input is not a learning request.
 
 ### System Behavior
 
 The model acts as a concept canonicalizer for an adaptive learning platform. It extracts a precise, structured representation of what the student wants to learn. It must output only raw JSON, with no markdown, no preamble, no explanation, and no trailing text.
 
-The source contract says the model must produce exactly three fields on success and must return the exact `{"error":"NOT_A_LEARNING_REQUEST"}` object when the input is not a learning request.
+The public route still exposes exactly three fields on success, but the model-facing contract is now a structured semantic draft. The server normalizes that draft and renders `description` deterministically.
+Canonicalization uses a grounded hybrid lane:
 
-### Required Output Fields On Success
+- grounded inventory match for approved broad/high-volume prompts with a decisive candidate
+- grounded-plus-model when a small approved candidate set is plausible
+- model-only for long-tail or low-confidence prompts
+
+### Required Model Output Fields On Success
 
 - `subject`
 - `topic`
-- `description`
+- `scope_summary`
+- `core_concepts`
+- `prerequisites`
+- `downstream_topics`
+- `level`
 
 ### Supported Subject Set
 
@@ -56,28 +65,24 @@ Examples:
 
 ### Description Rules
 
-The description is a canonical concept definition that will be embedded as a vector for semantic retrieval. It must follow this exact four-sentence structure with no deviation:
+The public description is a canonical concept definition that will be embedded as a vector for semantic retrieval. It is rendered server-side from the normalized semantic draft and must follow this exact four-sentence structure:
 
 1. `"{Topic} is the study of [what it covers at the highest level]."`
 2. `"It encompasses [list of 4-8 core subtopics or concepts, comma-separated]."`
 3. `"It assumes prior knowledge of [prerequisite topics] and serves as a foundation for [downstream topics]."`
 4. `"Within [subject], it is typically encountered at the [introductory|intermediate|advanced] level."`
 
-Additional rules:
+Model draft rules:
 
-- Exactly four sentences, no more and no less
-- Sentence 1 must start with the topic name followed by `is the study of`
-- Sentence 2 must start with `It encompasses`
-- Sentence 3 must start with `It assumes prior knowledge of` and must contain `and serves as a foundation for`
-- Sentence 4 must start with `Within` and must end with one of:
-  - `introductory level.`
-  - `intermediate level.`
-  - `advanced level.`
-- No opinions
-- No motivational language
-- No student-facing phrasing
-- No markdown
-- Total length must be 50 to 120 words
+- `scope_summary` must be one short topic-boundary phrase or sentence fragment
+- `scope_summary` must be 8 to 24 words after normalization
+- `scope_summary` must not end with trailing punctuation after normalization
+- `core_concepts` must contain 4 to 8 distinct core subtopics or concepts
+- `prerequisites` must list the prior knowledge the topic assumes
+- `downstream_topics` must list the 3 to 8 most important topics this becomes a foundation for, not every plausible downstream area
+- `level` must be exactly `introductory`, `intermediate`, or `advanced`
+- The model must not emit a `description` field
+- Preserve pedagogical salience in the original list order; normalization may dedupe entries, but it should not sort them for production rendering
 
 ### Interpretation Rules
 
@@ -98,6 +103,9 @@ Additional rules:
   - `philosophy` → `formal_logic`
 - If the prompt is nonsensical, off-topic, or not a learning request, return exactly `{"error":"NOT_A_LEARNING_REQUEST"}`
 - Never invent subjects or topics that do not correspond to real academic content
+- Inventory-covered broad-prompt narrowing is deterministic during canonicalization using an approved canonical concept inventory
+- When the inventory yields a medium-confidence candidate set, the model must choose from that provided candidate list rather than inventing a new topic
+- Prompts outside the grounded inventory remain model-driven during canonicalization
 
 ### User Prompt Contract
 
@@ -107,16 +115,16 @@ The student input is passed as:
 The student typed: "{prompt}"
 ```
 
-The model is instructed to extract the canonical subject, topic, and description from that prompt.
+The model is instructed to extract the canonical subject, topic, and semantic draft from that prompt.
 
 ### Output Format
 
 Respond with only a raw JSON object. No code fences. No preamble. No explanation.
 
-Success example:
+Success model-draft example:
 
 ```json
-{"subject":"mathematics","topic":"trigonometry","description":"Trigonometry is the study of the relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle. It encompasses sine, cosine, and tangent functions, their reciprocals, trigonometric identities, angle addition and subtraction formulas, the laws of sines and cosines, radian measure, and the graphing of periodic functions. It assumes prior knowledge of algebra and Euclidean geometry and serves as a foundation for calculus and classical mechanics. Within mathematics, it is typically encountered at the intermediate level."}
+{"subject":"mathematics","topic":"trigonometry","scope_summary":"the relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle","core_concepts":["sine","cosine","tangent","trigonometric identities","laws of sines and cosines","radian measure","graphing of periodic functions"],"prerequisites":["algebra","Euclidean geometry"],"downstream_topics":["calculus","classical mechanics"],"level":"intermediate"}
 ```
 
 Failure example:
@@ -144,13 +152,25 @@ The current validation contract in `AGENTS.md` is:
    - `philosophy`
    - `general`
 4. `topic` must match `/^[a-z][a-z0-9_]*$/`
-5. `description` must have exactly 4 sentences, checked by splitting on `. `
-6. Sentence 1 must start with a capital letter and contain `is the study of`
-7. Sentence 2 must start with `It encompasses`
-8. Sentence 3 must start with `It assumes prior knowledge of` and contain `and serves as a foundation for`
-9. Sentence 4 must start with `Within` and end with one of the allowed level phrases
-10. `description` word count must be between 50 and 120
-11. If any check fails, retry once with identical input, then fail with a descriptive error
+5. `scope_summary` must be a non-empty topic-boundary summary
+6. `core_concepts`, `prerequisites`, and `downstream_topics` must be non-empty string arrays
+7. `level` must be one of the allowed level values
+8. The server may apply only safe local normalization before rendering the public description:
+   - trim/collapse whitespace
+   - strip trailing punctuation
+   - slug-normalize `topic`
+   - drop empty items
+   - dedupe while preserving first-seen order
+9. The server must not use local normalization to invent missing prerequisites, infer level from nothing, or rewrite topic scope
+10. The server may select an inventory-backed canonical topic before the model call when the grounded candidate is decisive; this is not considered unsafe local rewriting because the inventory is part of the canonicalize contract
+11. The canonicalization metadata recorded internally must include:
+   - `canonicalization_source`: `grounded_match | grounded_plus_model | model_only`
+   - `inventory_candidate_topics`
+   - `candidate_confidence_band`
+   - `canonicalization_version`
+12. The rendered public `description` must satisfy the four-sentence contract
+13. If normalization still leaves the draft invalid, issue one targeted repair call using the original prompt, invalid draft, validation failures, and any active grounded candidate set, then fail descriptively if that repair also fails
+14. Downstream graph orchestration may thread `prerequisites` and `downstream_topics` as boundary-only metadata when available; those fields are used directly for deterministic boundary checks instead of reparsing the rendered description
 
 Additional source caveat:
 
@@ -159,8 +179,10 @@ Additional source caveat:
 ### Important Canonicalize Caveats
 
 - `general` is a first-class allowed subject and serves as the fallback when no domain-specific subject fits
-- The description is also used for semantic retrieval, so it must describe the topic boundary clearly enough to support vector matching
+- The rendered description is also used for semantic retrieval, so the semantic draft must preserve the topic boundary clearly enough to support vector matching
+- The graph route may accept optional explicit boundary fields on direct debug calls; that is an orchestration concern, not a change to the canonicalize public success shape
 - The canonicalizer should prefer the most specific confident topic, but not force arbitrary precision if the prompt is vague
+- The canonical concept inventory exists to make high-volume ambiguous prompts more decision-stable without forcing the entire system into alias-table-only routing
 
 ## Graph Generator Prompt
 
@@ -349,6 +371,14 @@ The current server-side validation contract is:
 13. No isolated nodes
 14. DAG check succeeds
 15. If any check fails, retry once with the same input, then fail with a descriptive error listing violated invariants
+
+Before accepting or forwarding a graph draft, the server may apply safe deterministic normalization that does not change topic semantics:
+
+- recompute positions from the hard-edge DAG
+- drop exact duplicate edges
+- prune deterministically redundant hard edges
+- preserve node ids and titles
+- never invent missing nodes or rewrite scope
 
 ### Graph Generator Caveats
 

@@ -9,6 +9,7 @@ import {
   canonicalizePrompt,
   type CanonicalizeDependencies,
 } from "@/lib/server/canonicalize";
+import { toPublicCanonicalizeSuccess } from "@/lib/server/canonicalize-output";
 import { createRequestLogContext, logError, logInfo } from "@/lib/logging";
 
 export const runtime = "nodejs";
@@ -33,11 +34,13 @@ export async function handleCanonicalizeRequest(
 
     logInfo(context, "canonicalize", "start", "Canonicalize route received request");
     const result = await canonicalizePrompt(parsed.data.prompt, context, dependencies);
-    canonicalizeResultSchema.parse(result);
+    const publicResult =
+      "error" in result ? result : toPublicCanonicalizeSuccess(result);
+    canonicalizeResultSchema.parse(publicResult);
     logInfo(context, "canonicalize", "success", "Canonicalize route completed", {
-      result_type: "error" in result ? "error" : "success",
+      result_type: "error" in publicResult ? "error" : "success",
     });
-    return NextResponse.json(result);
+    return NextResponse.json(publicResult);
   } catch (error) {
     const normalized = normalizeError(error);
     logError(context, "canonicalize", "Canonicalize route failed", normalized);

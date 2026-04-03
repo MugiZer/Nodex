@@ -31,6 +31,8 @@ Generate an interactive p5.js sketch only when the interaction genuinely improve
   - `quiz_json`
 - `static_diagram` is the fallback visual asset for nodes that should not receive a trustworthy interactive sketch
 - This prompt does not create `static_diagram`; it only consumes it
+- The visual prompt only needs the graph's subject, topic, description, and the node list with `id`, `title`, and `position`
+- The visual prompt must not carry lesson bundles, diagnostic bundles, or the full edge list
 
 ### Output Shape
 
@@ -118,6 +120,8 @@ It is a short boundary-detection signal used to estimate the learner's entry poi
 - The graph is already final and validated
 - The questions are built from the final node set and edges
 - The diagnostic flow uses these questions to move up or down the graph
+- The diagnostic prompt only needs the graph's subject, topic, description, node list with `id`, `title`, and `position`, plus hard prerequisite edges
+- The diagnostic prompt must not carry the lesson bundle or soft edges
 
 ### Output Shape
 

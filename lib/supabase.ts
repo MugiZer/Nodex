@@ -3,13 +3,18 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 import { requirePublicEnv, requireServerEnv } from "@/lib/env";
 import type {
+  CurriculumAuditRecord,
   DiagnosticQuestion,
   Edge,
   Graph,
+  GenerationCurriculumAuditStatus,
+  GenerationCurriculumOutcomeBucket,
+  GenerationFailureCategory,
   ProgressAttempt,
   ProgressWriteResponse,
   QuizItem,
   RetrievalCandidate,
+  LessonStatus,
   SupportedSubject,
   UserProgress,
 } from "@/lib/types";
@@ -63,6 +68,12 @@ export type FoundationDatabase = {
         Update: UserProgressUpdate;
         Relationships: [];
       };
+      generation_curriculum_audits: {
+        Row: CurriculumAuditDbRow;
+        Insert: CurriculumAuditInsert;
+        Update: CurriculumAuditUpdate;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -83,6 +94,17 @@ export type FoundationDatabase = {
           p_timestamp: string;
         };
         Returns: ProgressWriteResponse;
+      };
+      store_generated_graph: {
+        Args: {
+          p_graph: Json;
+          p_nodes: Json;
+          p_edges: Json;
+          p_embedding: string;
+        };
+        Returns: {
+          graph_id: string;
+        }[];
       };
     };
     Enums: Record<string, never>;
@@ -119,6 +141,7 @@ type NodeDbRow = {
   visual_verified: boolean;
   quiz_json: QuizItem[] | null;
   diagnostic_questions: DiagnosticQuestion[] | null;
+  lesson_status: LessonStatus;
   position: number;
   attempt_count: number;
   pass_count: number;
@@ -147,6 +170,31 @@ type UserProgressInsert = {
   attempts?: ProgressAttempt[];
 };
 type UserProgressUpdate = Partial<UserProgressInsert>;
+
+type CurriculumAuditDbRow = CurriculumAuditRecord & {
+  failure_category: GenerationFailureCategory | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type CurriculumAuditInsert = {
+  request_id: string;
+  request_fingerprint: string;
+  subject: SupportedSubject;
+  topic: string;
+  audit_status: GenerationCurriculumAuditStatus;
+  outcome_bucket: GenerationCurriculumOutcomeBucket;
+  attempt_count: number;
+  failure_category: GenerationFailureCategory | null;
+  parse_error_summary: string | null;
+  duration_ms: number;
+  issue_count: number;
+  async_audit: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type CurriculumAuditUpdate = Partial<CurriculumAuditInsert>;
 
 export type FoundationSupabaseClient = SupabaseClient<FoundationDatabase>;
 

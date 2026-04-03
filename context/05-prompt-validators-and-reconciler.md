@@ -16,19 +16,31 @@ All three roles operate on the same generated knowledge-graph data:
 - `Subject`
 - `Topic`
 - `Description`
+- optional boundary metadata: `prerequisites[]`, `downstream_topics[]`
 - `nodes[]`
 - `edges[]`
 
-The structure validator and curriculum validator are separate Claude calls with no shared hidden context.
+The curriculum validator is an isolated Claude call with no shared hidden context.
+The structure validator contract is satisfied by deterministic server code by default, because graph mechanics and topology acceptance are server-owned truth.
+If a bounded model-assisted structure audit is used later, it must remain optional and subordinate to deterministic server validation.
 The reconciler receives the original graph plus both validator outputs and produces the final repaired graph.
+The server validates graph proposals and reconciled graphs in layered deterministic gates:
+
+- shape validation
+- semantic graph validation
+- state validation
+
+No graph artifact may proceed to the next stage unless all three gates pass.
+Node positions are a deterministic server-owned field derived from the final hard-edge DAG; model-provided positions may be recomputed locally before final graph acceptance.
 
 ## Structure Validator
 
 ### Role
 
 Adversarial auditor for graph mechanics.
+In V1 this role is fulfilled by deterministic server code by default, not by trusting an LLM on the critical path.
 Its only job is to find structural problems that would break mastery-gated progression, create cycles, strand nodes, or expose nodes before their hard prerequisites are sufficient.
-It should assume the generator made mistakes.
+If a future model-assisted audit is added, it should assume the generator made mistakes and it must never override deterministic validation.
 
 ### What It Checks
 
@@ -89,7 +101,7 @@ It should assume the generator made mistakes.
 
 ### Output Contract
 
-The structure validator must return raw JSON only.
+The accepted structure validator output is always raw JSON only, regardless of whether it was produced entirely by deterministic code or merged with an optional bounded model-assisted audit.
 
 If issues are found:
 
@@ -131,14 +143,15 @@ If the graph is structurally sound:
 - Vague statements such as "some edges might be wrong" are not acceptable.
 - Keep descriptions to one sentence.
 - Keep suggested fixes to one sentence.
+- Set `valid` to `true` only when `issues` is empty; set `valid` to `false` whenever `issues` is non-empty.
 - Do not suggest adding nodes.
 - Do not suggest removing nodes.
 - Do not rewrite the graph.
 - If the graph is genuinely sound, say so instead of inventing issues.
 
-### User Prompt Inputs
+### Inputs
 
-The validator receives:
+The structure validation stage receives:
 
 - `Subject`
 - `Topic`
@@ -153,8 +166,10 @@ The server accepts the structure validator output only if:
 1. JSON parses
 2. `valid` is a boolean
 3. `issues` is an array
-4. if `valid` is `true`, `issues` must be empty
-5. if `valid` is `false`, `issues` must be non-empty
+4. the server derives the accepted `valid` value from `issues.length`:
+   - `issues.length = 0` -> accepted result uses `valid: true`
+   - `issues.length > 0` -> accepted result uses `valid: false`
+5. a mismatched model-emitted `valid` flag may be normalized locally instead of forcing a retry
 6. every issue includes:
    - `type`
    - `severity`
@@ -176,16 +191,23 @@ The server accepts the structure validator output only if:
 10. every node id in `nodes_involved` must reference a valid input node
 11. `description` must be non-empty
 12. `suggested_fix` must be non-empty
-13. if any check fails, retry once with the same input
-14. if the second attempt fails, raise a descriptive error listing the violated invariants
+13. deterministic graph checks may emit accepted issues directly without calling a model
+14. if an optional model-assisted audit is used, its output must still satisfy this schema and may be merged with deterministic findings
+15. if any optional model-assisted check fails schema validation, retry once with the same input
+16. if the second optional model-assisted attempt fails, raise a descriptive error listing the violated invariants
 
 ## Curriculum Validator
 
 ### Role
 
 Adversarial auditor for curriculum alignment.
+It proposes curriculum findings when the model can do so within budget, but it is not the source of truth for graph acceptance.
 It checks whether the graph teaches the right things in the right order for the canonical topic and level.
 It should be conservative and only flag issues with strong curriculum justification.
+In the current route implementation this audit may be launched as a detached best-effort task after the synchronous graph path is already accepted, so curriculum never blocks graph delivery.
+When detached, the validator receives a compact payload containing only `subject`, `topic`, `description`, the ordered `{id,title,position}` node list, and the hard-edge list.
+Detached curriculum uses a single attempt by default and does not inherit the generic multi-attempt retry policy for malformed JSON.
+If this bounded audit times out or fails contract validation, the server records `skipped_timeout` or `skipped_contract_failure`, continues with a synchronous placeholder state for the graph route, and persists the detached audit separately.
 
 ### Curriculum Frame
 
@@ -280,6 +302,8 @@ The intended graph size is 10 to 25 nodes, roughly comparable to a tight textboo
 - Sentence 2 defines the in-scope core.
 - Sentence 3 defines assumed prior knowledge and downstream topics.
 - Sentence 4 defines the level.
+- When orchestration supplies explicit `prerequisites[]` and `downstream_topics[]`, boundary validation must use those structured fields directly; it must not depend on reparsing the rendered description string.
+- The validator prompt should not re-expand prerequisite summaries into prose unless a future test proves that it materially improves findings.
 - Do not ask for assumed prior knowledge as if it were new graph content.
 - Do not ask for downstream topics as if they were core content.
 - Do not treat optional applications as missing concepts.
@@ -327,6 +351,16 @@ If the graph is curriculum-sound:
 }
 ```
 
+If the bounded curriculum audit fails or times out, the server does not invent replacement issues.
+It records that no curriculum findings were accepted for that request and continues with the accepted empty result:
+
+```json
+{
+  "valid": true,
+  "issues": []
+}
+```
+
 ### Field Rules
 
 - `nodes_involved`
@@ -335,6 +369,7 @@ If the graph is curriculum-sound:
 - `missing_concept_title`
   - required and non-null only when `type = "missing_concept"`
   - otherwise must be `null`
+- The graph route response may mark curriculum as a synchronous placeholder while the detached audit continues in the background.
 - `description`
   - one sentence
   - specific
@@ -363,6 +398,7 @@ If the graph is curriculum-sound:
 - Be conservative.
 - Judge against broad consensus, not personal preference.
 - Respect topic scope and level exactly.
+- Set `valid` to `true` only when `issues` is empty; set `valid` to `false` whenever `issues` is non-empty.
 - Do not rewrite the graph.
 - Do not produce corrected nodes or edges.
 - Do not suggest exact edge types.
@@ -387,8 +423,10 @@ The server accepts the curriculum validator output only if:
 1. JSON parses
 2. `valid` is a boolean
 3. `issues` is an array
-4. if `valid` is `true`, `issues` must be empty
-5. if `valid` is `false`, `issues` must be non-empty
+4. the server derives the accepted `valid` value from `issues.length`:
+   - `issues.length = 0` -> accepted result uses `valid: true`
+   - `issues.length > 0` -> accepted result uses `valid: false`
+5. a mismatched model-emitted `valid` flag may be normalized locally instead of forcing a retry
 6. every issue includes:
    - `type`
    - `severity`
@@ -450,6 +488,7 @@ Resolve the validators' findings with the smallest possible graph drift while pr
   2. curriculum correctness
   3. structural soundness
   4. minimal change
+- The server may apply deterministic local repair for exact, repeatable mechanical defects before any LLM reconcile call; when that repair fully resolves the issue set, the result is `deterministic_only_repaired` rather than a model-driven reconcile.
 
 #### 2. Minimal-Change Principle
 
@@ -491,6 +530,7 @@ Prefer fixes in this order:
 - Sentence 3 defines assumed prior knowledge and downstream topics.
 - Sentence 4 defines the level.
 - If a validator recommendation would push the graph outside the described boundary, reject it and keep the graph in scope.
+- If boundary metadata is present from orchestration, use it directly for the boundary guard instead of trying to infer boundaries from prose.
 
 #### 6. Hard-Edge Sufficiency Rule
 
@@ -542,6 +582,7 @@ The reconciler must return raw JSON only.
   ],
   "resolution_summary": [
     {
+      "issue_key": "structure:redundant_edge:node_1,node_2",
       "issue_source": "structure_validator | curriculum_validator | both",
       "issue_description": "Short description of the issue resolved.",
       "resolution_action": "Short description of what was changed."
@@ -607,9 +648,14 @@ The reconciler output is machine-validated and must satisfy all of these:
 20. graph matches the stated level
 21. `resolution_summary` is a non-empty array if any validator reported issues
 22. each `resolution_summary` item has:
+    - `issue_key`
     - `issue_source`
     - `issue_description`
     - `resolution_action`
+23. `issue_key` must reference a validator issue accepted by the server for this request
+24. every accepted validator issue must be covered exactly once in `resolution_summary` unless deterministic local repair already resolved it and emitted the corresponding summary entry
+25. if deterministic machine validation still fails after the first reconciler output, the server may issue one targeted reconcile-repair call that includes the invalid reconciler output plus the exact violated invariants
+26. if the targeted reconcile-repair output still fails deterministic validation, the pipeline must fail descriptively instead of proceeding
 
 ### Reconciliation Heuristics
 
