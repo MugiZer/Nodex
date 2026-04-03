@@ -25,7 +25,7 @@ import { computeStageTimeout } from "../timeout-model";
 const CONTENT_STAGE_CONCURRENCY = 3;
 const LESSON_NODE_MAX_TOKENS = 1800;
 const DIAGNOSTIC_NODE_MAX_TOKENS = 400;
-const VISUAL_NODE_MAX_TOKENS = 900;
+const VISUAL_NODE_MAX_TOKENS = 2500;
 
 export const LESSON_TIMEOUT_MS = computeStageTimeout(LESSON_NODE_MAX_TOKENS);
 export const DIAGNOSTIC_TIMEOUT_MS = computeStageTimeout(DIAGNOSTIC_NODE_MAX_TOKENS);
@@ -116,7 +116,9 @@ function buildDiagnosticsSystemPrompt(): string {
     "You are the Foundation diagnostic generator for a single node.",
     "Return only raw JSON.",
     "Generate exactly one diagnostic question for adaptive placement.",
-    "This is not the mastery quiz.",
+    "This is not the mastery quiz. Use the question to distinguish 'understands this node' from 'does not yet understand this node'.",
+    "Target the node's central concept, not downstream applications. Do not test assumed prior knowledge or downstream topics.",
+    "Avoid trick wording and unnecessary computation unless the node itself is procedural. Do not create mastery-style mini-exams.",
     "The diagnostic question must include 4 options, correct_index, difficulty_order, and node_id matching the provided node id.",
     "Questions must be short and discriminative, focused on the node's central concept.",
     "Output schema: {\"id\":\"node_1\",\"diagnostic_questions\":[{\"question\":\"...\",\"options\":[\"...\",\"...\",\"...\",\"...\"],\"correct_index\":0,\"difficulty_order\":1,\"node_id\":\"node_1\"}]}",
@@ -131,6 +133,11 @@ function buildVisualsSystemPrompt(): string {
     "If a trustworthy interactive sketch is not appropriate, return p5_code as an empty string and visual_verified as false.",
     "Verified visuals must define setup and draw and call createCanvas(480, 320).",
     "Do not use imports, exports, external assets, network requests, or asynchronous behavior.",
+    "Prefer simple, stable, deterministic sketches. Treat the visual as an enhancement, not the primary lesson.",
+    "Never change curriculum, titles, or graph structure.",
+    "Do not build a full application around the sketch, and do not combine multiple downstream concepts.",
+    "Do not depend on HTML controls outside the sketch unless necessary.",
+    "Do not hide the concept behind decorative motion. Do not use randomness in a way that makes the idea unstable or confusing.",
     "Output schema: {\"id\":\"node_1\",\"p5_code\":\"...\",\"visual_verified\":true}",
   ].join(" ");
 }

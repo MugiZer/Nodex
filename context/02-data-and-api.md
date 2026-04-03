@@ -239,7 +239,7 @@ Notes:
 
 ### `POST /api/generate/visuals`
 
-- Input: `{ subject: string, topic: string, description: string, nodes: DiagnosticEnrichedNode[], edges: Edge[] }`
+- Input: `{ subject: string, topic: string, description: string, nodes: NodeDraft[] }`
 - Output: shared stage result envelope with `stage: "visuals"` and `data: { nodes: VisualArtifact[] }`
 - This route enriches nodes with `p5_code` and `visual_verified`
 - If a faithful interactive sketch is not likely to work, return empty `p5_code` and `visual_verified: false`

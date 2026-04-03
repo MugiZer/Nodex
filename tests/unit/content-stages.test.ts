@@ -129,8 +129,8 @@ describe("content stages", () => {
 
     expect(output.nodes).toHaveLength(DAY2_VISUAL_NODES.length);
     expect(capturedPrompts).toHaveLength(DAY2_GRAPH_DRAFT.nodes.length);
-    expect(capturedMaxTokens.every((value) => value === 900)).toBe(true);
-    expect(VISUAL_TIMEOUT_MS).toBe(computeStageTimeout(900));
+    expect(capturedMaxTokens.every((value) => value === 2500)).toBe(true);
+    expect(VISUAL_TIMEOUT_MS).toBe(computeStageTimeout(2500));
     expect(capturedPrompts[0]).toContain("Node title:");
     expect(capturedPrompts[0]).not.toContain("Diagnostic bundle:");
     expect(capturedPrompts[0]).not.toContain("quiz_json");
