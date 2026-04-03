@@ -350,14 +350,15 @@ export const lessonsRouteRequestSchema = stageContextSchema
 
 export const diagnosticsRouteRequestSchema = stageContextSchema
   .extend({
-    nodes: z.array(generationNodeDraftSchema).min(10).max(25),
+    nodes: z.array(lessonEnrichedNodeSchema).min(10).max(25),
     edges: z.array(generationEdgeDraftSchema).min(1),
   })
   .strict();
 
 export const visualsRouteRequestSchema = stageContextSchema
   .extend({
-    nodes: z.array(generationNodeDraftSchema).min(10).max(25),
+    nodes: z.array(diagnosticEnrichedNodeSchema).min(10).max(25),
+    edges: z.array(generationEdgeDraftSchema).min(1),
   })
   .strict();
 

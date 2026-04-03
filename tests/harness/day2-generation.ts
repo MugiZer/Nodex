@@ -49,8 +49,6 @@ export type Day2VisualNode = Day2DiagnosticNode & {
   visual_verified: boolean;
 };
 
-export type Day2VisualRouteNode = Pick<Day2GraphNodeDraft, "id" | "title" | "position">;
-
 export type Day2TraceStageName =
   | "canonicalize"
   | "retrieve"
@@ -422,33 +420,6 @@ function buildVisualNodes(nodes: Day2DiagnosticNode[], verifiedNodeIds: Set<stri
       ...node,
       p5_code: visualVerified ? createP5Code(node.title) : "",
       visual_verified: visualVerified,
-    };
-  });
-}
-
-export function buildDay2VisualRouteNodes(input: {
-  lessonNodes: Array<
-    Pick<
-      Day2LessonNode,
-      "id" | "title" | "position" | "lesson_text" | "static_diagram" | "quiz_json"
-    >
-  >;
-  diagnosticNodes: Array<Pick<Day2DiagnosticNode, "id" | "diagnostic_questions">>;
-}): Day2VisualRouteNode[] {
-  const diagnosticById = new Map(
-    input.diagnosticNodes.map((node) => [node.id, node.diagnostic_questions] as const),
-  );
-
-  return input.lessonNodes.map((node) => {
-    const diagnosticQuestions = diagnosticById.get(node.id);
-    if (!diagnosticQuestions) {
-      throw new Error(`Missing diagnostic questions for node ${node.id}.`);
-    }
-
-    return {
-      id: node.id,
-      title: node.title,
-      position: node.position,
     };
   });
 }

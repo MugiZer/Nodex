@@ -9,7 +9,6 @@ import {
   DAY2_GRAPH_DRAFT,
   DAY2_LESSON_NODES,
   DAY2_VISUAL_FALLBACK_NODES,
-  buildDay2VisualRouteNodes,
 } from "../harness/day2-generation";
 
 const canonicalContext = {
@@ -92,13 +91,7 @@ describe("POST /api/generate/visuals", () => {
         method: "POST",
         body: JSON.stringify({
           ...canonicalContext,
-          nodes: buildDay2VisualRouteNodes({
-            lessonNodes: DAY2_LESSON_NODES,
-            diagnosticNodes: diagnosticsJson.data.nodes.map(({ id, diagnostic_questions }) => ({
-              id,
-              diagnostic_questions,
-            })),
-          }),
+          nodes: DAY2_GRAPH_DRAFT.nodes,
         }),
       }),
       {
@@ -126,19 +119,42 @@ describe("POST /api/generate/visuals", () => {
     });
   });
 
+  it("rejects diagnostics-shaped nodes before visuals runs", async () => {
+    const response = await handleVisualsRequest(
+      new Request("http://localhost/api/generate/visuals", {
+        method: "POST",
+        body: JSON.stringify({
+          ...canonicalContext,
+          nodes: DAY2_DIAGNOSTIC_NODES.map(({ id, diagnostic_questions }) => ({
+            id,
+            diagnostic_questions,
+          })),
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "INVALID_REQUEST_BODY",
+      message: "Expected body with subject, topic, description, and nodes for visuals.",
+      details: {
+        fieldErrors: {
+          nodes: expect.arrayContaining([
+            expect.stringContaining("expected string"),
+            expect.stringContaining("expected number"),
+          ]),
+        },
+      },
+    });
+  });
+
   it("records fallback activation as a warning instead of a hard failure", async () => {
     const response = await handleVisualsRequest(
       new Request("http://localhost/api/generate/visuals", {
         method: "POST",
         body: JSON.stringify({
           ...canonicalContext,
-          nodes: buildDay2VisualRouteNodes({
-            lessonNodes: DAY2_LESSON_NODES,
-            diagnosticNodes: DAY2_DIAGNOSTIC_NODES.map(({ id, diagnostic_questions }) => ({
-              id,
-              diagnostic_questions,
-            })),
-          }),
+          nodes: DAY2_GRAPH_DRAFT.nodes,
         }),
       }),
       {
@@ -178,13 +194,7 @@ describe("POST /api/generate/visuals", () => {
         method: "POST",
         body: JSON.stringify({
           ...canonicalContext,
-          nodes: buildDay2VisualRouteNodes({
-            lessonNodes: DAY2_LESSON_NODES,
-            diagnosticNodes: DAY2_DIAGNOSTIC_NODES.map(({ id, diagnostic_questions }) => ({
-              id,
-              diagnostic_questions,
-            })),
-          }),
+          nodes: DAY2_GRAPH_DRAFT.nodes,
         }),
       }),
       {
