@@ -20,7 +20,7 @@ export function createGenerateRequest(input: GenerateRequest): GenerateRequest {
 }
 
 export function createGenerateResponse(input: GenerateResponse): GenerateResponse {
-  return generateResponseSchema.parse(input);
+  return generateResponseSchema.parse(input) as GenerateResponse;
 }
 
 export function createStoreRequest(input: StoreRequest): StoreRequest {

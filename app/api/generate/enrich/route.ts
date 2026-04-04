@@ -17,6 +17,7 @@ export async function handleGenerateEnrichRequest(
   request: Request,
   dependencies: IncrementalEnrichmentDependencies = {},
 ): Promise<NextResponse> {
+  console.log("[enrich] Route handler entered");
   const logContext = createRequestLogContext("POST /api/generate/enrich");
 
   try {

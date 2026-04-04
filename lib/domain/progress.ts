@@ -66,7 +66,11 @@ function sortNodesForDiagnostic(nodes: Node[]): Node[] {
   });
 }
 
-export function getDiagnosticStartNode(nodes: Node[]): Node {
+export function getDiagnosticStartNode(nodes: Node[]): Node | null {
+  if (nodes.length === 0) {
+    return null;
+  }
+
   const sorted = sortNodesForDiagnostic(nodes);
   const maxPosition = Math.max(...sorted.map((node) => node.position));
   const startPosition = Math.floor(maxPosition / 2);
@@ -84,7 +88,7 @@ export function getDiagnosticStartNode(nodes: Node[]): Node {
     return lower;
   }
 
-  return sorted[0];
+  return sorted[0] ?? null;
 }
 
 export function getNextDiagnosticNode(
@@ -139,7 +143,11 @@ export function getNextDiagnosticNode(
 export function getDiagnosticRecommendation(
   nodes: Node[],
   answers: DiagnosticAnswer[],
-): string {
+): string | null {
+  if (nodes.length === 0) {
+    return null;
+  }
+
   const sorted = sortNodesForDiagnostic(nodes);
   const correctNodeIds = new Set(
     answers.filter((answer) => answer.correct).map((answer) => answer.node_id),
@@ -147,13 +155,14 @@ export function getDiagnosticRecommendation(
 
   const correctNodes = sorted.filter((node) => correctNodeIds.has(node.id));
   if (correctNodes.length === 0) {
-    return sorted[0].id;
+    return sorted[0]?.id ?? null;
   }
 
   const highestPosition = Math.max(...correctNodes.map((node) => node.position));
   return (
     sorted.find((node) => node.position === highestPosition)?.id ??
-    correctNodes[correctNodes.length - 1].id
+    correctNodes[correctNodes.length - 1]?.id ??
+    null
   );
 }
 
@@ -180,7 +189,7 @@ export function simulateDiagnosticRun(
   }
 
   return {
-    start_node_id: startNode.id,
+    start_node_id: startNode?.id ?? null,
     asked_node_ids: askedNodeIds,
     recommended_node_id: getDiagnosticRecommendation(nodes, answers),
   };

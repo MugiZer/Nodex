@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { jsonError, normalizeError } from "@/lib/errors";
+import { ApiError, jsonError, normalizeError } from "@/lib/errors";
 import { createRequestLogContext, logError, logInfo } from "@/lib/logging";
 import { graphPayloadSchema } from "@/lib/schemas";
 import {
@@ -25,6 +25,18 @@ export async function handleGraphReadRequest(
     const userId = await requireAuthenticatedUserId(request, dependencies);
     const payload = await loadGraphPayload(id, userId, dependencies);
     const validated = graphPayloadSchema.parse(payload);
+
+    if (validated.nodes.length === 0) {
+      throw new ApiError(
+        "GRAPH_INCOMPLETE",
+        "The graph payload is incomplete: no nodes were persisted for this graph version.",
+        503,
+        {
+          graph_id: id,
+          graph_version: validated.graph.version,
+        },
+      );
+    }
 
     logInfo(logContext, "graph_read", "success", "Graph payload loaded.", {
       graph_id: validated.graph.id,

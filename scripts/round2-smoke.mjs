@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 
 import nextEnv from "@next/env";
 import { createClient } from "@supabase/supabase-js";
+import { ensureDbContract } from "./db-contract-check.mjs";
 
 const { loadEnvConfig } = nextEnv;
 
@@ -445,6 +446,7 @@ async function cleanupTempGraph(client, ids) {
 }
 
 async function main() {
+  await ensureDbContract();
   const client = createServiceClient();
   const subject = "general";
   const graphId = crypto.randomUUID();

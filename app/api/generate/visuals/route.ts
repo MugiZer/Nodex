@@ -29,7 +29,7 @@ export async function handleVisualsRequest(
           : null;
       const issues = parsed.error.flatten();
       const requestError = new Error(
-        "Expected body with subject, topic, description, and nodes for visuals.",
+        "Expected body with subject, topic, description, and graph nodes for visuals.",
       );
       logError(logContext, "visuals", "Visuals request validation failed.", requestError, {
         node_count: nodeCount,
@@ -39,7 +39,7 @@ export async function handleVisualsRequest(
         {
           error: "INVALID_REQUEST_BODY",
           message:
-            "Expected body with subject, topic, description, and nodes for visuals.",
+            "Expected body with subject, topic, description, and graph nodes for visuals.",
           details: issues,
         },
         { status: 400 },

@@ -133,10 +133,14 @@ The following Pack 4 decisions are fixed in this split context and are no longer
   - the orchestrator does not return partial graph state
   - no partially generated graph is persisted on timeout
 - Exact numeric timeout budgets remain deferred to the ops/deployment pack.
+- Exception for MVP live generation:
+  - the dedicated debug routes keep timeout-as-failure semantics
+  - live `POST /api/generate` may recover from canonicalize draft timeout when the bounded repair path also fails contract validation, by using a deterministic fallback canonicalization instead of surfacing a learner-facing 502
 
 #### F. Partial failure / fallback policy
 
 - If canonicalize returns `{"error":"NOT_A_LEARNING_REQUEST"}`, stop immediately and do not proceed.
+- If live `POST /api/generate` hits canonicalize draft timeout and the one repair pass still returns schema-invalid output, it may use a deterministic fallback canonicalization for the demo path instead of aborting.
 - If retrieval returns a usable cached graph, stop generation and return the cache hit.
 - If graph generation, deterministic structure validation, or reconciliation fails, abort the generation path and persist nothing.
 - If curriculum validation times out or fails, log the skipped advisory audit, continue with an accepted empty curriculum issue set in the synchronous response, and allow the detached audit to finish for telemetry if it can.

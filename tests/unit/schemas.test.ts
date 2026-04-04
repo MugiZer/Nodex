@@ -12,8 +12,12 @@ import {
   edgeSchema,
   graphRouteRequestSchema,
   graphRouteResponseSchema,
+  graphSchema,
   graphPayloadSchema,
   nodeSchema,
+  progressAttemptSchema,
+  progressWriteRequestSchema,
+  retrievalCandidateSchema,
   supportedSubjectSchema,
   retrieveRequestSchema,
   retrieveResponseSchema,
@@ -109,5 +113,90 @@ describe("schema validation", () => {
       description: canonicalizeSuccessFixture.description,
     })).not.toThrow();
     expect(() => retrieveResponseSchema.parse({ graph_id: baseGraphFixture.id })).not.toThrow();
+  });
+
+  it("accepts database timestamps with explicit UTC offsets", () => {
+    const offsetTimestamp = "2026-04-01T12:00:00+00:00";
+    const postgresTimestamp = "2025-06-23 16:42:07.869646+00";
+    const postgresCompactOffsetTimestamp = "2025-06-23 16:42:07.869646+0000";
+    const naiveDbTimestamp = "2026-04-03T18:49:09";
+
+    expect(
+      graphSchema.parse({
+        ...baseGraphFixture,
+        created_at: offsetTimestamp,
+      }).created_at,
+    ).toBe(offsetTimestamp);
+
+    expect(
+      retrievalCandidateSchema.parse({
+        id: baseGraphFixture.id,
+        similarity: 0.95,
+        flagged_for_review: false,
+        version: 1,
+        created_at: offsetTimestamp,
+      }).created_at,
+    ).toBe(offsetTimestamp);
+
+    expect(
+      progressAttemptSchema.parse({
+        score: 2,
+        timestamp: offsetTimestamp,
+      }).timestamp,
+    ).toBe(offsetTimestamp);
+
+    expect(
+      userProgressSchema.parse({
+        ...baseProgressFixture[0],
+        attempts: [
+          {
+            score: 2,
+            timestamp: offsetTimestamp,
+          },
+        ],
+      }).attempts[0].timestamp,
+    ).toBe(offsetTimestamp);
+
+    expect(
+      graphSchema.parse({
+        ...baseGraphFixture,
+        created_at: postgresTimestamp,
+      }).created_at,
+    ).toBe("2025-06-23T16:42:07.869646+00:00");
+
+    expect(
+      graphSchema.parse({
+        ...baseGraphFixture,
+        created_at: postgresCompactOffsetTimestamp,
+      }).created_at,
+    ).toBe("2025-06-23T16:42:07.869646+00:00");
+
+    expect(
+      retrievalCandidateSchema.parse({
+        id: baseGraphFixture.id,
+        similarity: 0.95,
+        flagged_for_review: false,
+        version: 1,
+        created_at: naiveDbTimestamp,
+      }).created_at,
+    ).toBe("2026-04-03T18:49:09Z");
+  });
+
+  it("keeps public request timestamps strict ISO with offsets", () => {
+    expect(
+      retrieveRequestSchema.safeParse({
+        subject: "mathematics",
+        description: canonicalizeSuccessFixture.description,
+      }).success,
+    ).toBe(true);
+
+    expect(
+      progressWriteRequestSchema.safeParse({
+        graph_id: baseGraphFixture.id,
+        node_id: baseNodesFixture[0]?.id,
+        score: 2,
+        timestamp: "2026-04-03T18:49:09",
+      }).success,
+    ).toBe(false);
   });
 });

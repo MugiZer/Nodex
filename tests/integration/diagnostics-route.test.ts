@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { handleDiagnosticsRequest } from "@/app/api/generate/diagnostics/route";
+import { buildDiagnosticsRouteRequest } from "@/lib/server/generation/stage-inputs";
 
 import { DAY2_DIAGNOSTIC_NODES, DAY2_GRAPH_DRAFT, DAY2_LESSON_NODES } from "../harness/day2-generation";
 
@@ -16,11 +17,13 @@ describe("POST /api/generate/diagnostics", () => {
     const response = await handleDiagnosticsRequest(
       new Request("http://localhost/api/generate/diagnostics", {
         method: "POST",
-        body: JSON.stringify({
-          ...canonicalContext,
-          nodes: DAY2_LESSON_NODES.map(({ id, title, position }) => ({ id, title, position })),
-          edges: DAY2_GRAPH_DRAFT.edges,
-        }),
+        body: JSON.stringify(
+          buildDiagnosticsRouteRequest({
+            ...canonicalContext,
+            graph: DAY2_GRAPH_DRAFT,
+            lessonArtifacts: DAY2_LESSON_NODES,
+          }),
+        ),
       }),
       {
         callModel: async ({ userPrompt }) => {
@@ -59,11 +62,13 @@ describe("POST /api/generate/diagnostics", () => {
     const response = await handleDiagnosticsRequest(
       new Request("http://localhost/api/generate/diagnostics", {
         method: "POST",
-        body: JSON.stringify({
-          ...canonicalContext,
-          nodes: DAY2_LESSON_NODES.map(({ id, title, position }) => ({ id, title, position })),
-          edges: DAY2_GRAPH_DRAFT.edges,
-        }),
+        body: JSON.stringify(
+          buildDiagnosticsRouteRequest({
+            ...canonicalContext,
+            graph: DAY2_GRAPH_DRAFT,
+            lessonArtifacts: DAY2_LESSON_NODES,
+          }),
+        ),
       }),
       {
         callModel: async ({ userPrompt }) => {

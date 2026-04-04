@@ -33,6 +33,13 @@ The server validates graph proposals and reconciled graphs in layered determinis
 No graph artifact may proceed to the next stage unless all three gates pass.
 Node positions are a deterministic server-owned field derived from the final hard-edge DAG; model-provided positions may be recomputed locally before final graph acceptance.
 
+MVP/demo-mode interpretation:
+
+- The live `POST /api/generate` path should treat repairable structural defects as inputs to repair, not as automatic learner-facing failures.
+- The strict graph route may still fail fast so engineering can inspect exact defects.
+- If a live graph cannot be made perfect but can be made structurally solid and demo-safe, the system should prefer the solid simplified graph.
+- In live mode, only shape failures remain hard blockers at the graph-generation boundary. Parsed structural defects should flow into deterministic repair, reconcile, or a final fallback DAG.
+
 ## Structure Validator
 
 ### Role
@@ -212,7 +219,7 @@ If this bounded audit times out or fails contract validation, the server records
 ### Curriculum Frame
 
 This validator operates on topic-scoped mastery graphs, not full courses.
-The intended graph size is 10 to 25 nodes, roughly comparable to a tight textbook chapter or unit.
+The intended graph size is 4 to 25 nodes, roughly comparable to a tight textbook chapter or unit.
 
 ### Research Protocol
 
@@ -541,7 +548,7 @@ Prefer fixes in this order:
 
 #### 7. Curriculum-Scale Rule
 
-- This graph is a topic-scoped unit, usually 10 to 25 nodes.
+- This graph is a topic-scoped unit, usually 4 to 25 nodes.
 - Do not inflate it into a full course.
 - Do not shrink it so far that it stops covering the topic.
 - Do not add filler nodes.
@@ -600,7 +607,7 @@ The reconciler must return raw JSON only.
 - `id` must match the pattern `node_N`
 - `title` must be a concise concept name, 2 to 6 words, Title Case
 - `position` must be a non-negative integer
-- Total node count must remain between 10 and 25
+- Total node count must remain between 4 and 25
 - Every node must be atomic
 - Every node must be necessary
 - Every node must remain within topic boundary
@@ -627,7 +634,7 @@ The reconciler must return raw JSON only.
 The reconciler output is machine-validated and must satisfy all of these:
 
 1. JSON parses without error
-2. `nodes` is an array with length between 10 and 25
+2. `nodes` is an array with length between 4 and 25
 3. every node has `id`, `title`, `position`
 4. all node ids are unique
 5. every node id matches `/^node_[1-9][0-9]*$/`

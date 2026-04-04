@@ -18,7 +18,10 @@ type GraphReadQueryLogEntry = {
   };
 };
 
-function createGraphReadServiceClient(payload: GraphPayload): {
+function createGraphReadServiceClient(
+  payload: GraphPayload,
+  surfaceErrors: Partial<Record<GraphReadQueryLogEntry["table"], string>> = {},
+): {
   client: unknown;
   queryLog: GraphReadQueryLogEntry[];
 } {
@@ -74,9 +77,17 @@ function createGraphReadServiceClient(payload: GraphPayload): {
       return orderedRows;
     };
 
-    const builder = {
-      select(fields?: string) {
+      const builder = {
+      select(fields?: string, options?: { head?: boolean; count?: string }) {
         void fields;
+        if (options?.head) {
+          const errorMessage = surfaceErrors[table];
+          return Promise.resolve({
+            data: [],
+            error: errorMessage ? { message: errorMessage } : null,
+          });
+        }
+
         return builder;
       },
       eq(field: string, value: unknown) {
@@ -90,6 +101,14 @@ function createGraphReadServiceClient(payload: GraphPayload): {
       order(field: string, options?: { ascending?: boolean }) {
         tracker.order.push({ field, ascending: options?.ascending ?? true });
         return builder;
+      },
+      limit(count: number) {
+        void count;
+        const errorMessage = surfaceErrors[table];
+        return Promise.resolve({
+          data: [],
+          error: errorMessage ? { message: errorMessage } : null,
+        });
       },
       maybeSingle() {
         if (table !== "graphs") {
@@ -197,16 +216,36 @@ describe("persistence and auth hardening", () => {
 
   it("falls back to direct graph reads when retrieval RPC is unavailable", async () => {
     const candidateGraphId = "77777777-7777-4777-8777-777777777777";
+    const createRowsBuilder = (rows: Array<Record<string, unknown>>) => {
+      const builder = {
+        select() {
+          return builder;
+        },
+        eq() {
+          return builder;
+        },
+        in() {
+          return builder;
+        },
+        not() {
+          return builder;
+        },
+        then(resolve: (value: { data: Array<Record<string, unknown>>; error: null }) => unknown) {
+          return Promise.resolve({ data: rows, error: null }).then(resolve);
+        },
+      };
+
+      return builder;
+    };
+
     const fakeClient = {
       rpc: vi.fn().mockResolvedValue({
         data: null,
         error: { message: "rpc unavailable" },
       }),
-      from: vi.fn().mockReturnValue({
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        not: vi.fn().mockResolvedValue({
-          data: [
+      from: vi.fn((table: string) => {
+        if (table === "graphs") {
+          return createRowsBuilder([
             {
               id: candidateGraphId,
               embedding: `[${[1, 0, 0].join(",")}]`,
@@ -214,9 +253,23 @@ describe("persistence and auth hardening", () => {
               version: 1,
               created_at: "2026-04-01T00:00:00.000Z",
             },
-          ],
-          error: null,
-        }),
+          ]);
+        }
+
+        if (table === "nodes") {
+          return createRowsBuilder([{ id: candidateGraphId }]);
+        }
+
+        if (table === "edges") {
+          return createRowsBuilder([
+            {
+              from_node_id: candidateGraphId,
+              to_node_id: candidateGraphId,
+            },
+          ]);
+        }
+
+        throw new Error(`Unexpected table in retrieval fallback test: ${table}`);
       }),
     };
 
@@ -521,5 +574,65 @@ describe("persistence and auth hardening", () => {
         order: [{ field: "node_id", ascending: true }],
       },
     });
+  });
+
+  it("normalizes naive DB graph timestamps during graph read parsing", async () => {
+    const graphPayload: GraphPayload = JSON.parse(
+      JSON.stringify(baseGraphPayloadFixture),
+    ) as GraphPayload;
+
+    graphPayload.graph.created_at = "2026-04-03T18:49:09";
+
+    const fixture = createGraphReadServiceClient(graphPayload);
+    const payload = await loadGraphPayload(TEST_GRAPH_ID, TEST_USER_ID, {
+      createServiceClient: () => fixture.client as never,
+    });
+
+    expect(payload.graph.created_at).toBe("2026-04-03T18:49:09Z");
+  });
+
+  it("derives lesson_status during graph read when the DB row does not expose it", async () => {
+    const graphPayload: GraphPayload = JSON.parse(
+      JSON.stringify(baseGraphPayloadFixture),
+    ) as GraphPayload;
+
+    const graphPayloadWithoutStatus: GraphPayload = {
+      ...graphPayload,
+      nodes: graphPayload.nodes.map((node) => {
+        const { lesson_status, ...nodeWithoutStatus } = node;
+        void lesson_status;
+        return nodeWithoutStatus as typeof node;
+      }),
+    };
+
+    const fixture = createGraphReadServiceClient(graphPayloadWithoutStatus);
+
+    const payload = await loadGraphPayload(TEST_GRAPH_ID, TEST_USER_ID, {
+      createServiceClient: () => fixture.client as never,
+    });
+
+    expect(payload.nodes.map((node) => node.lesson_status)).toEqual(["ready", "ready", "ready"]);
+  });
+
+  it("treats nodes with lesson artifacts as ready even when the DB status is stale pending", async () => {
+    const graphPayload: GraphPayload = JSON.parse(
+      JSON.stringify(baseGraphPayloadFixture),
+    ) as GraphPayload;
+
+    graphPayload.nodes = graphPayload.nodes.map((node, index) =>
+      index === 0
+        ? {
+            ...node,
+            lesson_status: "pending",
+          }
+        : node,
+    );
+
+    const fixture = createGraphReadServiceClient(graphPayload);
+    const payload = await loadGraphPayload(TEST_GRAPH_ID, TEST_USER_ID, {
+      createServiceClient: () => fixture.client as never,
+    });
+
+    expect(payload.nodes[0]?.lesson_status).toBe("ready");
   });
 });

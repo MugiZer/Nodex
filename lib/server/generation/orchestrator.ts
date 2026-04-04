@@ -5,14 +5,13 @@ import {
   logError,
   logInfo,
 } from "@/lib/logging";
-import { decideRetrievalCandidate } from "@/lib/domain/retrieval";
 import {
   canonicalizePrompt,
   type CanonicalizeDependencies,
 } from "@/lib/server/canonicalize";
 import {
   embedDescription,
-  loadRetrievalCandidates,
+  retrieveGraphId,
   type RetrievalDependencies,
 } from "@/lib/server/retrieve";
 
@@ -34,6 +33,7 @@ import {
 } from "./incremental";
 import { storeGraphSkeleton, type StoreGraphDependencies } from "./store";
 import {
+  buildFallbackDagFromDraft,
   runCurriculumValidator,
   runGraphGenerator,
   runReconciler,
@@ -64,6 +64,11 @@ export type GenerationPipelineResult = {
   state: GenerationRunState;
   response: GenerateRouteResponse;
 };
+
+type CanonicalizedPrompt = Exclude<
+  Awaited<ReturnType<typeof canonicalizePrompt>>,
+  { error: "NOT_A_LEARNING_REQUEST" }
+>;
 
 function createInitialRunState(requestId: string, prompt: string): GenerationRunState {
   return generationRunStateSchema.parse({
@@ -152,6 +157,9 @@ function classifyError(error: unknown): GenerationFailureCategory {
     if (normalizedCode === "UPSTREAM_TIMEOUT") {
       return "upstream_timeout";
     }
+    if (normalizedCode === "DB_SCHEMA_OUT_OF_SYNC") {
+      return "store_error";
+    }
     if (normalizedCode.includes("STORE") || normalizedCode.includes("ENRICH")) {
       return "store_error";
     }
@@ -160,78 +168,106 @@ function classifyError(error: unknown): GenerationFailureCategory {
   return "unexpected_internal_error";
 }
 
-export async function runGenerationPipeline(
+export async function canonicalizeGenerationPrompt(
   prompt: string,
   context: RequestLogContext,
   dependencies: GenerationPipelineDependencies = {},
+): Promise<CanonicalizedPrompt> {
+  const canonicalized = await canonicalizePrompt(prompt, context, dependencies, {
+    mode: "demo",
+  });
+  if ("error" in canonicalized) {
+    throw new ApiError(
+      "NOT_A_LEARNING_REQUEST",
+      "The prompt could not be mapped to a learning request.",
+      400,
+    );
+  }
+
+  return canonicalized;
+}
+
+export async function continueGenerationPipeline(
+  input: {
+    prompt: string;
+    canonicalized: CanonicalizedPrompt;
+  },
+  context: RequestLogContext,
+  dependencies: GenerationPipelineDependencies = {},
 ): Promise<GenerationPipelineResult> {
-  let state = createInitialRunState(context.requestId, prompt);
+  let state = createInitialRunState(context.requestId, input.prompt);
 
   try {
-    logInfo(context, "generate", "start", "Starting generate orchestrator.");
-    state = appendRunLog(state, "generate", "start", "Generate pipeline started.");
-
-    const canonicalized = await canonicalizePrompt(prompt, context, dependencies);
-    if ("error" in canonicalized) {
-      throw new ApiError(
-        "NOT_A_LEARNING_REQUEST",
-        "The prompt could not be mapped to a learning request.",
-        400,
-      );
-    }
-
+    logInfo(context, "generate", "start", "Continuing generate orchestrator after canonicalize.");
+    state = appendRunLog(state, "generate", "start", "Generate pipeline continued after canonicalize.");
     state.request_route = context.route;
     state.request_started_at = new Date(context.startedAtMs).toISOString();
-    state.prompt_hash = hashPrompt(prompt);
-    state.canonicalized = canonicalized;
+    state.prompt_hash = hashPrompt(input.prompt);
+    state.canonicalized = input.canonicalized;
+
+    const embedding =
+      dependencies.precomputedEmbedding ??
+      (await embedDescription(input.canonicalized.description, dependencies));
 
     logInfo(context, "retrieve", "start", "Running retrieval for canonicalized prompt.");
-    const embedding = await embedDescription(canonicalized.description, dependencies);
-    const retrievalCandidates = await loadRetrievalCandidates(
-      canonicalized.subject,
-      embedding,
-      dependencies,
+    const retrievalResult = await retrieveGraphId(
+      {
+        subject: input.canonicalized.subject,
+        description: input.canonicalized.description,
+      },
+      {
+        ...dependencies,
+        precomputedEmbedding: embedding,
+      },
     );
-    const retrievalDecision = decideRetrievalCandidate(retrievalCandidates);
 
-    state.retrieval_candidates = retrievalCandidates;
-    state.retrieval_decision = retrievalDecision;
-
-    if (retrievalDecision.graph_id) {
+    if (retrievalResult.graph_id) {
       state.execution_path = "cache_hit";
-      state.final_graph_id = retrievalDecision.graph_id;
+      state.final_graph_id = retrievalResult.graph_id;
 
       return {
         state: generationRunStateSchema.parse(state),
         response: generateRouteResponseSchema.parse({
-          graph_id: retrievalDecision.graph_id,
+          request_id: context.requestId,
+          graph_id: retrievalResult.graph_id,
+          diagnostic: null,
+          status: "ready",
+          topic: input.canonicalized.topic,
           cached: true,
         }),
       };
     }
 
     state.execution_path = "generate";
+    state.retrieval_candidates = [];
+    state.retrieval_decision = {
+      graph_id: null,
+      reason: "no_candidates",
+      candidate: null,
+    };
 
     const generatedGraphDraft = await runGraphGenerator(
-      canonicalized,
+      input.canonicalized,
       context,
       dependencies.graphGeneratorDependencies,
+      { validationMode: "demo" },
     );
     state.generated_graph_draft = generatedGraphDraft;
 
     const structure = await runStructureValidator(
       {
-        ...canonicalized,
+        ...input.canonicalized,
         nodes: generatedGraphDraft.nodes,
         edges: generatedGraphDraft.edges,
       },
       context,
       dependencies.structureValidatorDependencies,
+      { auditMode: "demo" },
     );
 
     launchDetachedCurriculumAudit(
       {
-        ...canonicalized,
+        ...input.canonicalized,
         nodes: generatedGraphDraft.nodes,
         edges: generatedGraphDraft.edges,
       },
@@ -247,18 +283,61 @@ export async function runGenerationPipeline(
     state.validator_outputs.curriculum = curriculum;
     state.validator_outputs.curriculum_audit_status = curriculumResult.auditStatus;
 
-    const reconciled = await runReconciler(
-      {
-        ...canonicalized,
-        nodes: generatedGraphDraft.nodes,
-        edges: generatedGraphDraft.edges,
-        structure,
-        curriculum,
-        curriculumAuditStatus: curriculumResult.auditStatus,
-      },
-      context,
-      dependencies.reconcilerDependencies,
-    );
+    let reconciled: Awaited<ReturnType<typeof runReconciler>>;
+    try {
+      reconciled = await runReconciler(
+        {
+          ...input.canonicalized,
+          nodes: generatedGraphDraft.nodes,
+          edges: generatedGraphDraft.edges,
+          structure,
+          curriculum,
+          curriculumAuditStatus: curriculumResult.auditStatus,
+          boundaryPolicy: {
+            prerequisite: "error",
+            downstream: "warn",
+          },
+        },
+        context,
+        dependencies.reconcilerDependencies,
+      );
+    } catch (error) {
+      const fallbackGraph = buildFallbackDagFromDraft(generatedGraphDraft.nodes);
+      const fallbackStructure = await runStructureValidator(
+        {
+          ...input.canonicalized,
+          nodes: fallbackGraph.nodes,
+          edges: fallbackGraph.edges,
+        },
+        context,
+        dependencies.structureValidatorDependencies,
+        { auditMode: "demo" },
+      );
+      if (!fallbackStructure.valid) {
+        throw error;
+      }
+
+      logInfo(
+        context,
+        "reconcile",
+        "success",
+        "Used fallback DAG after reconcile failure in demo mode.",
+        {
+          failure_code: error instanceof ApiError ? error.code : "unexpected_reconcile_error",
+          original_issue_count: structure.issues.length,
+          fallback_node_count: fallbackGraph.nodes.length,
+          fallback_edge_count: fallbackGraph.edges.length,
+        },
+      );
+
+      reconciled = {
+        nodes: fallbackGraph.nodes,
+        edges: fallbackGraph.edges,
+        resolution_summary: [],
+        repair_mode: "deterministic_only",
+        boundary_warnings: [],
+      };
+    }
 
     state.reconciled_graph = {
       nodes: reconciled.nodes,
@@ -269,10 +348,10 @@ export async function runGenerationPipeline(
     const stored = await storeGraphSkeleton(
       {
         graph: {
-          title: normalizeTopicTitle(canonicalized.topic),
-          subject: canonicalized.subject,
-          topic: canonicalized.topic,
-          description: canonicalized.description,
+          title: normalizeTopicTitle(input.canonicalized.topic),
+          subject: input.canonicalized.subject,
+          topic: input.canonicalized.topic,
+          description: input.canonicalized.description,
         },
         nodes: reconciled.nodes,
         edges: reconciled.edges,
@@ -294,7 +373,11 @@ export async function runGenerationPipeline(
       return {
         state: generationRunStateSchema.parse(state),
         response: generateRouteResponseSchema.parse({
+          request_id: context.requestId,
           graph_id: stored.duplicate_of_graph_id,
+          diagnostic: null,
+          status: "ready",
+          topic: input.canonicalized.topic,
           cached: true,
         }),
       };
@@ -345,7 +428,11 @@ export async function runGenerationPipeline(
     }
 
     const response = generateRouteResponseSchema.parse({
+      request_id: context.requestId,
       graph_id: stored.graph_id,
+      diagnostic: null,
+      status: "ready",
+      topic: input.canonicalized.topic,
       cached: false,
     });
 
@@ -353,6 +440,7 @@ export async function runGenerationPipeline(
       graph_id: response.graph_id,
       cached: response.cached,
       initial_node_ids: initialNodeIds,
+      boundary_warning_count: reconciled.boundary_warnings?.length ?? 0,
     });
 
     return {
@@ -373,4 +461,20 @@ export async function runGenerationPipeline(
     });
     throw error;
   }
+}
+
+export async function runGenerationPipeline(
+  prompt: string,
+  context: RequestLogContext,
+  dependencies: GenerationPipelineDependencies = {},
+): Promise<GenerationPipelineResult> {
+  const canonicalized = await canonicalizeGenerationPrompt(prompt, context, dependencies);
+  return continueGenerationPipeline(
+    {
+      prompt,
+      canonicalized,
+    },
+    context,
+    dependencies,
+  );
 }

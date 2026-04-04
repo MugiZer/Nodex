@@ -65,6 +65,7 @@ export async function handleGraphGenerateRequest(
       parsed.data,
       context,
       dependencies.graphGeneratorDependencies,
+      { validationMode: "strict" },
     );
     const graphGenerateMs = Date.now() - graphGenerateStartedAt;
 

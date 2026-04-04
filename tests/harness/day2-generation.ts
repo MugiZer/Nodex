@@ -15,6 +15,7 @@ import type {
   GenerationNodeDraft,
   QuizItem,
 } from "@/lib/types";
+import { buildDeterministicVisualArtifact } from "@/lib/server/generation/visual-templates";
 
 const DAY2_NODE_COUNT = 10;
 
@@ -348,21 +349,6 @@ function createDiagnosticQuestion(
   };
 }
 
-function createP5Code(title: string): string {
-  const safeTitle = JSON.stringify(title);
-  return [
-    "function setup() {",
-    "  createCanvas(480, 320);",
-    "}",
-    "function draw() {",
-    "  background(248);",
-    "  fill(15);",
-    "  textSize(20);",
-    `  text(${safeTitle}, 24, 48);`,
-    "}",
-  ].join("\n");
-}
-
 export function buildDay2GraphDraft(): {
   nodes: Day2GraphNodeDraft[];
   edges: GenerationEdgeDraft[];
@@ -413,15 +399,28 @@ function buildDiagnosticNodes(nodes: Day2LessonNode[]): Day2DiagnosticNode[] {
   }));
 }
 
-function buildVisualNodes(nodes: Day2DiagnosticNode[], verifiedNodeIds: Set<string>): Day2VisualNode[] {
+function buildVisualNodes(nodes: Day2DiagnosticNode[]): Day2VisualNode[] {
   return nodes.map((node) => {
-    const visualVerified = verifiedNodeIds.has(node.id);
+    const artifact = buildDeterministicVisualArtifact({
+      subject: "mathematics",
+      topic: "trigonometry",
+      node,
+    });
+
     return {
       ...node,
-      p5_code: visualVerified ? createP5Code(node.title) : "",
-      visual_verified: visualVerified,
+      p5_code: artifact.p5_code,
+      visual_verified: artifact.visual_verified,
     };
   });
+}
+
+function buildStaticFallbackVisualNodes(nodes: Day2DiagnosticNode[]): Day2VisualNode[] {
+  return nodes.map((node) => ({
+    ...node,
+    p5_code: "",
+    visual_verified: false,
+  }));
 }
 
 export function selectNodeVisualArtifact(
@@ -444,10 +443,7 @@ export function buildDay2SuccessTrace(): Day2TraceFixture {
   const draft = buildDay2GraphDraft();
   const lessonNodes = buildLessonNodes(draft.nodes);
   const diagnosticNodes = buildDiagnosticNodes(lessonNodes);
-  const visualNodes = buildVisualNodes(
-    diagnosticNodes,
-    new Set(["node_1", "node_4", "node_7"]),
-  );
+  const visualNodes = buildVisualNodes(diagnosticNodes);
 
   return {
     request_id: "day2-success-trace",
@@ -494,7 +490,7 @@ export function buildDay2VisualFallbackTrace(): Day2TraceFixture {
   const draft = buildDay2GraphDraft();
   const lessonNodes = buildLessonNodes(draft.nodes);
   const diagnosticNodes = buildDiagnosticNodes(lessonNodes);
-  const visualNodes = buildVisualNodes(diagnosticNodes, new Set());
+  const visualNodes = buildStaticFallbackVisualNodes(diagnosticNodes);
 
   return {
     request_id: "day2-visual-fallback-trace",
@@ -541,11 +537,8 @@ export const DAY2_DUPLICATE_TRACE = buildDay2DuplicateTrace();
 export const DAY2_GRAPH_DRAFT = buildDay2GraphDraft();
 export const DAY2_LESSON_NODES = buildLessonNodes(DAY2_GRAPH_DRAFT.nodes);
 export const DAY2_DIAGNOSTIC_NODES = buildDiagnosticNodes(DAY2_LESSON_NODES);
-export const DAY2_VISUAL_NODES = buildVisualNodes(
-  DAY2_DIAGNOSTIC_NODES,
-  new Set(["node_1", "node_4", "node_7"]),
-);
-export const DAY2_VISUAL_FALLBACK_NODES = buildVisualNodes(DAY2_DIAGNOSTIC_NODES, new Set());
+export const DAY2_VISUAL_NODES = buildVisualNodes(DAY2_DIAGNOSTIC_NODES);
+export const DAY2_VISUAL_FALLBACK_NODES = buildStaticFallbackVisualNodes(DAY2_DIAGNOSTIC_NODES);
 export const DAY2_TRACE_STAGE_ORDER = traceStageOrder;
 
 export const DAY2_PARTIAL_FAILURE_TRACE: unknown = {
@@ -588,11 +581,7 @@ export const DAY2_PARTIAL_FAILURE_TRACE: unknown = {
     {
       stage: "visuals",
       output: {
-        nodes: DAY2_DIAGNOSTIC_NODES.map((node) => ({
-          ...node,
-          p5_code: node.id === "node_1" ? "" : createP5Code(node.title),
-          visual_verified: node.id !== "node_1",
-        })),
+        nodes: DAY2_VISUAL_NODES,
       },
     },
   ],

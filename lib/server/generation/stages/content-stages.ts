@@ -19,6 +19,7 @@ import {
   type VisualNodeArtifact,
   type VisualStageOutput,
 } from "../contracts";
+import { buildDeterministicVisualArtifact } from "../visual-templates";
 import { executeLlmStage, type LlmStageDependencies } from "../llm-stage";
 import { computeStageTimeout } from "../timeout-model";
 
@@ -125,23 +126,6 @@ function buildDiagnosticsSystemPrompt(): string {
   ].join(" ");
 }
 
-function buildVisualsSystemPrompt(): string {
-  return [
-    "You are the Foundation visual generator for a single node.",
-    "Return only raw JSON.",
-    "Generate an interactive p5 sketch only when it materially improves intuition for the node.",
-    "If a trustworthy interactive sketch is not appropriate, return p5_code as an empty string and visual_verified as false.",
-    "Verified visuals must define setup and draw and call createCanvas(480, 320).",
-    "Do not use imports, exports, external assets, network requests, or asynchronous behavior.",
-    "Prefer simple, stable, deterministic sketches. Treat the visual as an enhancement, not the primary lesson.",
-    "Never change curriculum, titles, or graph structure.",
-    "Do not build a full application around the sketch, and do not combine multiple downstream concepts.",
-    "Do not depend on HTML controls outside the sketch unless necessary.",
-    "Do not hide the concept behind decorative motion. Do not use randomness in a way that makes the idea unstable or confusing.",
-    "Output schema: {\"id\":\"node_1\",\"p5_code\":\"...\",\"visual_verified\":true}",
-  ].join(" ");
-}
-
 function buildLessonUserPrompt(
   input: LessonGraphInput,
   node: GenerationNodeDraft,
@@ -162,20 +146,6 @@ function buildLessonUserPrompt(
 
 function buildDiagnosticUserPrompt(
   input: DiagnosticGraphInput,
-  node: GenerationNodeDraft,
-): string {
-  return [
-    `Subject: ${input.subject}`,
-    `Topic: ${input.topic}`,
-    `Description: ${input.description}`,
-    `Node id: ${node.id}`,
-    `Node title: ${node.title}`,
-    `Node position: ${node.position}`,
-  ].join("\n\n");
-}
-
-function buildVisualUserPrompt(
-  input: VisualGraphInput,
   node: GenerationNodeDraft,
 ): string {
   return [
@@ -303,21 +273,10 @@ export async function runVisualStage(
     nodes: input.nodes,
     concurrency: CONTENT_STAGE_CONCURRENCY,
     worker: async (node) =>
-      executeLlmStage({
-        stage: "visuals",
-        systemPrompt: buildVisualsSystemPrompt(),
-        userPrompt: buildVisualUserPrompt(input, node),
-        schema: visualNodeArtifactSchema,
-        failureCategory: "llm_output_invalid",
-        timeoutMs: VISUAL_TIMEOUT_MS,
-        maxTokens: VISUAL_NODE_MAX_TOKENS,
-        context,
-        logDetails: {
-          node_id: node.id,
-          node_title: node.title,
-          node_position: node.position,
-        },
-        dependencies,
+      buildDeterministicVisualArtifact({
+        subject: input.subject,
+        topic: input.topic,
+        node,
       }),
   });
 

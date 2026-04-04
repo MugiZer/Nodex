@@ -1,14 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { ApiError } from "@/lib/errors";
 import type { RequestLogContext } from "@/lib/logging";
-import { logInfo } from "@/lib/logging";
+import { logInfo, logWarn } from "@/lib/logging";
 import { createSupabaseServiceRoleClient, type FoundationSupabaseClient } from "@/lib/supabase";
 import { RETRIEVAL_THRESHOLD, sortRetrievalCandidates } from "@/lib/domain/retrieval";
 import type { Node } from "@/lib/types";
 import type { Json } from "@/lib/supabase";
+import type { Database } from "@/supabase/database.types";
 import {
   nodeSchema,
+  retrievalCandidateSchema,
   validateCanonicalDescription,
   validateVisualP5CodeRestrictions,
 } from "@/lib/schemas";
@@ -18,6 +20,19 @@ import {
   type RetrievalDependencies,
 } from "@/lib/server/retrieve";
 import { formatVectorLiteral } from "@/lib/server/retrieve";
+import { parseSchemaOrThrow } from "@/lib/server/schema-parse";
+import {
+  createDbSchemaOutOfSyncError,
+  detectDbSurfaceAvailable,
+  ensureDbSurfaceAvailable,
+  ensureDbSurfacesAvailable,
+  isDbSchemaMismatchError,
+  STORE_FALLBACK_EDGES_SURFACE,
+  STORE_FALLBACK_GRAPHS_SURFACE,
+  STORE_FALLBACK_NODES_OPTIONAL_LESSON_STATUS_SURFACE,
+  STORE_FALLBACK_NODES_REQUIRED_SURFACE,
+  STORE_EXACT_DUPLICATE_SURFACE,
+} from "@/lib/server/db-contract";
 
 import {
   skeletonStoreRequestSchema,
@@ -40,6 +55,9 @@ export type StoreGraphDependencies = RetrievalDependencies & {
   createServiceClient?: () => FoundationSupabaseClient;
   createUuid?: () => string;
   precomputedEmbedding?: number[];
+  findExactDuplicateCandidates?: (
+    graph: Pick<StoreRouteRequest["graph"], "subject" | "topic" | "description">,
+  ) => Promise<DuplicateGraphCandidate[]>;
 };
 
 export type StoreGeneratedGraphResult = {
@@ -47,6 +65,17 @@ export type StoreGeneratedGraphResult = {
   duplicate_of_graph_id?: string;
   node_id_map?: Record<string, string>;
 };
+
+type DuplicateGraphCandidate = {
+  id: string;
+  similarity: number;
+  flagged_for_review: boolean;
+  version: number;
+  created_at: string;
+};
+
+type GraphDuplicateRow = Database["public"]["Tables"]["graphs"]["Row"];
+type NodeWriteMode = "with_lesson_status" | "without_lesson_status";
 
 export type StoreSkeletonResult = StoreGeneratedGraphResult & {
   version?: number;
@@ -122,6 +151,73 @@ function remapDiagnosticQuestionsNodeIds(
   }));
 }
 
+function createGraphIdentityFingerprint(
+  graph: Pick<StoreRouteRequest["graph"], "subject" | "topic" | "description">,
+): string {
+  return createHash("sha256")
+    .update([graph.subject, graph.topic, graph.description.replace(/\s+/g, " ").trim()].join("\n"))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+async function loadExactDuplicateCandidates(
+  graph: Pick<StoreRouteRequest["graph"], "subject" | "topic" | "description">,
+  dependencies: StoreGraphDependencies,
+): Promise<DuplicateGraphCandidate[]> {
+  if (dependencies.findExactDuplicateCandidates) {
+    return dependencies.findExactDuplicateCandidates(graph);
+  }
+
+  const client = getServiceClient(dependencies);
+  await ensureDbSurfaceAvailable(client, STORE_EXACT_DUPLICATE_SURFACE);
+  const { data, error } = await client
+    .from("graphs")
+    .select(STORE_EXACT_DUPLICATE_SURFACE.select)
+    .eq("subject", graph.subject)
+    .eq("topic", graph.topic)
+    .eq("description", graph.description);
+
+  if (error) {
+    if (isDbSchemaMismatchError(error)) {
+      throw createDbSchemaOutOfSyncError(STORE_EXACT_DUPLICATE_SURFACE, error, {
+        lookup_mode: "exact",
+      });
+    }
+
+    throw new ApiError(
+      "STORE_PERSISTENCE_UNAVAILABLE",
+      "Failed to load exact duplicate candidates.",
+      503,
+      { cause: error.message },
+    );
+  }
+
+  const duplicateRows = (data ?? []) as unknown as GraphDuplicateRow[];
+
+  return duplicateRows.map((candidate) =>
+    parseSchemaOrThrow({
+      schema: retrievalCandidateSchema,
+      value: {
+        id: candidate.id,
+        similarity: 1,
+        flagged_for_review: candidate.flagged_for_review,
+        version: candidate.version,
+        created_at: candidate.created_at,
+      },
+      errorCode: "STORE_UNEXPECTED_INTERNAL",
+      message: "Failed to parse exact duplicate candidate row returned from graphs.",
+      schemaName: "retrievalCandidateSchema",
+      phase: "store.duplicate_recheck.read_parse",
+      details: {
+        source_table: "graphs",
+        lookup_mode: "exact",
+        candidate_id: candidate.id,
+        raw_created_at: candidate.created_at,
+      },
+    }),
+  );
+}
+
 async function loadNextGraphVersion(
   client: FoundationSupabaseClient,
   graph: StoreRouteRequest["graph"],
@@ -151,30 +247,110 @@ async function loadNextGraphVersion(
   return currentVersion + 1;
 }
 
+type DuplicateGraphDecision = {
+  graph_id: string | null;
+  reason: "below_threshold" | "usable_unflagged_match" | "only_flagged_matches" | "no_candidates";
+  candidate: DuplicateGraphCandidate | null;
+  lookup_mode: "exact" | "semantic";
+};
+
+type DuplicateGraphLookupResult = {
+  decision: DuplicateGraphDecision;
+  embedding: number[] | null;
+};
+
 async function recheckForDuplicateGraph(
   graph: StoreRouteRequest["graph"],
-  embedding: number[],
   dependencies: StoreGraphDependencies,
-): Promise<string | null> {
-  const candidates = await loadRetrievalCandidates(
-    graph.subject,
-    embedding,
-    dependencies,
+): Promise<DuplicateGraphLookupResult> {
+  const exactCandidates = sortRetrievalCandidates(
+    await loadExactDuplicateCandidates(graph, dependencies),
   );
+
+  if (exactCandidates.length > 0) {
+    const usableExactMatch = exactCandidates.find((candidate) => !candidate.flagged_for_review);
+
+    if (!usableExactMatch) {
+      return {
+        decision: {
+          graph_id: null,
+          reason: "only_flagged_matches",
+          candidate: exactCandidates[0] ?? null,
+          lookup_mode: "exact",
+        },
+        embedding: null,
+      };
+    }
+
+    return {
+      decision: {
+        graph_id: usableExactMatch.id,
+        reason: "usable_unflagged_match",
+        candidate: usableExactMatch,
+        lookup_mode: "exact",
+      },
+      embedding: null,
+    };
+  }
+
+  const embedding =
+    dependencies.precomputedEmbedding ??
+    (await embedDescription(graph.description, dependencies));
+  const candidates = await loadRetrievalCandidates(graph.subject, embedding, dependencies);
   const sortedCandidates = sortRetrievalCandidates(candidates);
   const thresholdCandidates = sortedCandidates.filter(
     (candidate) => candidate.similarity >= RETRIEVAL_THRESHOLD,
   );
 
+  if (sortedCandidates.length === 0) {
+    return {
+      decision: {
+        graph_id: null,
+        reason: "no_candidates",
+        candidate: null,
+        lookup_mode: "semantic",
+      },
+      embedding,
+    };
+  }
+
   if (thresholdCandidates.length === 0) {
-    return null;
+    return {
+      decision: {
+        graph_id: null,
+        reason: "below_threshold",
+        candidate: sortedCandidates[0] ?? null,
+        lookup_mode: "semantic",
+      },
+      embedding,
+    };
   }
 
   const usableMatch = thresholdCandidates.find((candidate) => !candidate.flagged_for_review);
-  return usableMatch?.id ?? null;
+  if (!usableMatch) {
+    return {
+      decision: {
+        graph_id: null,
+        reason: "only_flagged_matches",
+        candidate: thresholdCandidates[0] ?? null,
+        lookup_mode: "semantic",
+      },
+      embedding,
+    };
+  }
+
+  return {
+    decision: {
+      graph_id: usableMatch.id,
+      reason: "usable_unflagged_match",
+      candidate: usableMatch,
+      lookup_mode: "semantic",
+    },
+    embedding,
+  };
 }
 
-async function persistGraphRows(
+async function persistGraphRowsWithFallback(
   client: FoundationSupabaseClient,
   input: {
     graph: {
@@ -183,32 +359,285 @@ async function persistGraphRows(
       subject: StoreRouteRequest["graph"]["subject"];
       topic: string;
       description: string;
+      embedding: number[];
       version: number;
       flagged_for_review: boolean;
-      created_at: string;
     };
     nodes: Array<Record<string, unknown>>;
     edges: Array<Record<string, unknown>>;
     embedding: number[];
   },
+  context?: RequestLogContext,
 ): Promise<string> {
-  const { data, error } = await client.rpc("store_generated_graph", {
-    p_graph: input.graph,
-    p_nodes: input.nodes as Json,
-    p_edges: input.edges as Json,
-    p_embedding: formatVectorLiteral(input.embedding),
+  const persistWithRpc = async (): Promise<string> => {
+    const { data, error } = await client.rpc("store_generated_graph", {
+      p_graph: input.graph,
+      p_nodes: input.nodes as Json,
+      p_edges: input.edges as Json,
+      p_embedding: formatVectorLiteral(input.embedding),
+    });
+
+    if (error) {
+      throw new ApiError(
+        "STORE_GRAPH_INSERT_FAILED",
+        "Failed to persist the generated graph.",
+        503,
+        { cause: error.message },
+      );
+    }
+
+    return data?.[0]?.graph_id ?? input.graph.id;
+  };
+
+  try {
+    return await persistWithRpc();
+  } catch (error) {
+    if (!shouldFallbackFromStoreRpc(error)) {
+      throw error;
+    }
+
+    logWarn(
+      context ?? {
+        requestId: "store",
+        route: "store",
+        startedAtMs: Date.now(),
+      },
+      "store",
+      "success",
+      "Store RPC was unavailable; falling back to direct table writes.",
+      {
+        graph_id: input.graph.id,
+        graph_version: input.graph.version,
+        write_mode: "rpc_fallback_direct",
+        fallback_node_write_mode: "detected_at_insert_time",
+      },
+    );
+
+    return persistGraphRowsDirect(client, {
+      graph: input.graph,
+      nodes: input.nodes,
+      edges: input.edges,
+    });
+  }
+}
+
+function shouldFallbackFromStoreRpc(error: unknown): boolean {
+  const candidate = error as {
+    code?: unknown;
+    message?: unknown;
+    details?: unknown;
+    cause?: unknown;
+  };
+  const pieces: string[] = [];
+
+  if (error instanceof ApiError) {
+    pieces.push(error.code, error.message);
+  }
+
+  if (typeof candidate.code === "string") {
+    pieces.push(candidate.code);
+  }
+
+  if (typeof candidate.message === "string") {
+    pieces.push(candidate.message);
+  }
+
+  if (typeof candidate.details === "string") {
+    pieces.push(candidate.details);
+  }
+
+  if (typeof candidate.details === "object" && candidate.details !== null) {
+    const nested = candidate.details as { cause?: unknown; message?: unknown };
+    if (typeof nested.cause === "string") {
+      pieces.push(nested.cause);
+    }
+    if (typeof nested.message === "string") {
+      pieces.push(nested.message);
+    }
+  }
+
+  if (typeof candidate.cause === "string") {
+    pieces.push(candidate.cause);
+  }
+
+  const haystack = pieces.join(" ").toLowerCase();
+
+  return (
+    haystack.includes("could not find the function") ||
+    haystack.includes("schema cache") ||
+    haystack.includes("pgrst202") ||
+    haystack.includes("pgrst204")
+  );
+}
+
+async function persistGraphRowsDirect(
+  client: FoundationSupabaseClient,
+  input: {
+    graph: {
+      id: string;
+      title: string;
+      subject: StoreRouteRequest["graph"]["subject"];
+      topic: string;
+      description: string;
+      embedding: number[];
+      version: number;
+      flagged_for_review: boolean;
+    };
+    nodes: Array<Record<string, unknown>>;
+    edges: Array<Record<string, unknown>>;
+  },
+): Promise<string> {
+  const persistedNodeIds = input.nodes
+    .map((node) => {
+      const nodeId = node.id;
+      return typeof nodeId === "string" ? nodeId : null;
+    })
+    .filter((nodeId): nodeId is string => nodeId !== null);
+
+  await ensureDbSurfacesAvailable(client, [
+    STORE_FALLBACK_GRAPHS_SURFACE,
+    STORE_FALLBACK_NODES_REQUIRED_SURFACE,
+    STORE_FALLBACK_EDGES_SURFACE,
+  ]);
+  const supportsLessonStatus = await detectDbSurfaceAvailable(
+    client,
+    STORE_FALLBACK_NODES_OPTIONAL_LESSON_STATUS_SURFACE,
+  );
+  const nodeWriteMode: NodeWriteMode = supportsLessonStatus
+    ? "with_lesson_status"
+    : "without_lesson_status";
+  const nodeInsertRows = input.nodes.map((node) => {
+    if (supportsLessonStatus) {
+      return node;
+    }
+
+    const { lesson_status, ...nodeWithoutLessonStatus } = node;
+    void lesson_status;
+    return nodeWithoutLessonStatus;
   });
 
-  if (error) {
+  const { error: graphError } = await client.from("graphs").insert({
+    id: input.graph.id,
+    title: input.graph.title,
+    subject: input.graph.subject,
+    topic: input.graph.topic,
+    description: input.graph.description,
+    embedding: input.graph.embedding,
+    version: input.graph.version,
+    flagged_for_review: input.graph.flagged_for_review,
+  });
+  if (graphError) {
+    if (isDbSchemaMismatchError(graphError)) {
+      throw createDbSchemaOutOfSyncError(STORE_FALLBACK_GRAPHS_SURFACE, graphError);
+    }
     throw new ApiError(
       "STORE_GRAPH_INSERT_FAILED",
-      "Failed to persist the generated graph.",
+      "Failed to persist the generated graph header row.",
       503,
-      { cause: error.message },
+      { cause: graphError.message },
     );
   }
 
-  return data?.[0]?.graph_id ?? input.graph.id;
+  try {
+    const { error: nodeError } = await client.from("nodes").insert(
+      nodeInsertRows as never,
+    );
+    if (nodeError) {
+      if (isDbSchemaMismatchError(nodeError)) {
+        throw createDbSchemaOutOfSyncError(
+          supportsLessonStatus
+            ? STORE_FALLBACK_NODES_OPTIONAL_LESSON_STATUS_SURFACE
+            : STORE_FALLBACK_NODES_REQUIRED_SURFACE,
+          nodeError,
+          { node_write_mode: nodeWriteMode },
+        );
+      }
+      throw new ApiError(
+        "STORE_GRAPH_INSERT_FAILED",
+        "Failed to persist the generated graph nodes.",
+        503,
+        { cause: nodeError.message, node_write_mode: nodeWriteMode },
+      );
+    }
+
+    const { error: edgeError } = await client.from("edges").insert(
+      input.edges as never,
+    );
+    if (edgeError) {
+      if (isDbSchemaMismatchError(edgeError)) {
+        throw createDbSchemaOutOfSyncError(STORE_FALLBACK_EDGES_SURFACE, edgeError);
+      }
+      throw new ApiError(
+        "STORE_GRAPH_INSERT_FAILED",
+        "Failed to persist the generated graph edges.",
+        503,
+        { cause: edgeError.message },
+      );
+    }
+  } catch (error) {
+    const cleanupResults = await Promise.allSettled([
+      client.from("edges").delete().in("from_node_id", persistedNodeIds).in("to_node_id", persistedNodeIds),
+      client.from("nodes").delete().eq("graph_id", input.graph.id),
+      client.from("graphs").delete().eq("id", input.graph.id),
+    ]);
+    const cleanupErrors = cleanupResults
+      .map((result, index) => {
+        if (result.status === "fulfilled") {
+          if (!result.value.error) {
+            return null;
+          }
+
+          const surface =
+            index === 0
+              ? STORE_FALLBACK_EDGES_SURFACE.name
+              : index === 1
+                ? STORE_FALLBACK_NODES_REQUIRED_SURFACE.name
+                : STORE_FALLBACK_GRAPHS_SURFACE.name;
+
+          return {
+            surface,
+            message: result.value.error.message,
+          };
+        }
+
+        const surface =
+          index === 0
+            ? STORE_FALLBACK_EDGES_SURFACE.name
+            : index === 1
+              ? STORE_FALLBACK_NODES_REQUIRED_SURFACE.name
+              : STORE_FALLBACK_GRAPHS_SURFACE.name;
+
+        const rejection = result.reason;
+        if (!rejection) {
+          return null;
+        }
+
+        return {
+          surface,
+          message: rejection instanceof Error ? rejection.message : String(rejection),
+        };
+      })
+      .filter((entry): entry is { surface: string; message: string } => entry !== null);
+
+    if (cleanupErrors.length > 0) {
+      throw new ApiError(
+        "STORE_PARTIAL_WRITE_PREVENTED",
+        "Generated graph persistence failed and the partial write could not be fully rolled back.",
+        503,
+        {
+          graph_id: input.graph.id,
+          node_ids: persistedNodeIds,
+          cleanup_errors: cleanupErrors,
+          cause:
+            error instanceof Error ? error.message : "Generated graph persistence failed.",
+        },
+      );
+    }
+
+    throw error;
+  }
+
+  return input.graph.id;
 }
 
 export async function storeGeneratedGraph(
@@ -237,9 +666,7 @@ export async function storeGeneratedGraph(
       ? contextOrDependencies
       : maybeDependencies;
   const client = getServiceClient(dependencies);
-  const embedding =
-    dependencies.precomputedEmbedding ??
-    (await embedDescription(parsedInput.graph.description, dependencies));
+  const graphFingerprint = createGraphIdentityFingerprint(parsedInput.graph);
 
   logInfo(
     context ?? {
@@ -250,18 +677,18 @@ export async function storeGeneratedGraph(
     "store",
     "start",
     "Starting graph store flow.",
-    { topic: parsedInput.graph.topic },
+    {
+      topic: parsedInput.graph.topic,
+      graph_identity_fingerprint: graphFingerprint,
+    },
   );
 
-  const duplicateGraphId = await recheckForDuplicateGraph(
-    parsedInput.graph,
-    embedding,
-    dependencies,
-  );
-  if (duplicateGraphId) {
+  const duplicateLookup = await recheckForDuplicateGraph(parsedInput.graph, dependencies);
+  const duplicateDecision = duplicateLookup.decision;
+  if (duplicateDecision.graph_id) {
     const duplicateResponse = {
-      graph_id: duplicateGraphId,
-      duplicate_of_graph_id: duplicateGraphId,
+      graph_id: duplicateDecision.graph_id,
+      duplicate_of_graph_id: duplicateDecision.graph_id,
     } satisfies StoreGeneratedGraphResult;
 
     logInfo(
@@ -273,7 +700,17 @@ export async function storeGeneratedGraph(
       "store",
       "success",
       "Store duplicate safeguard returned existing graph.",
-      { graph_id: duplicateGraphId },
+      {
+        graph_id: duplicateDecision.graph_id,
+        duplicate_reason: duplicateDecision.reason,
+        duplicate_candidate_id: duplicateDecision.candidate?.id ?? null,
+        duplicate_candidate_similarity: duplicateDecision.candidate?.similarity ?? null,
+        duplicate_candidate_flagged_for_review:
+          duplicateDecision.candidate?.flagged_for_review ?? null,
+        duplicate_threshold: RETRIEVAL_THRESHOLD,
+        duplicate_lookup_mode: duplicateDecision.lookup_mode,
+        graph_identity_fingerprint: graphFingerprint,
+      },
     );
 
     return duplicateResponse;
@@ -281,6 +718,10 @@ export async function storeGeneratedGraph(
 
   const graphId = (dependencies.createUuid ?? randomUUID)();
   const version = await loadNextGraphVersion(client, parsedInput.graph);
+  const embedding =
+    duplicateLookup.embedding ??
+    dependencies.precomputedEmbedding ??
+    (await embedDescription(parsedInput.graph.description, dependencies));
   const nodeIdMap = new Map<string, string>();
 
   const nodeRows = parsedInput.nodes.map((node) => {
@@ -371,21 +812,21 @@ export async function storeGeneratedGraph(
     } as const;
   });
 
-  const graphStoreId = await persistGraphRows(client, {
-    graph: {
-      id: graphId,
-      title: parsedInput.graph.title,
-      subject: parsedInput.graph.subject,
-      topic: parsedInput.graph.topic,
-      description: parsedInput.graph.description,
-      version,
-      flagged_for_review: false,
-      created_at: new Date().toISOString(),
+  const graphStoreId = await persistGraphRowsWithFallback(client, {
+      graph: {
+        id: graphId,
+        title: parsedInput.graph.title,
+        subject: parsedInput.graph.subject,
+        topic: parsedInput.graph.topic,
+        description: parsedInput.graph.description,
+        embedding,
+        version,
+        flagged_for_review: false,
     },
     nodes: nodeRows,
     edges: edgeRows,
     embedding,
-  });
+  }, context);
   const response = {
     graph_id: graphStoreId,
     node_id_map: Object.fromEntries(nodeIdMap.entries()),
@@ -431,9 +872,7 @@ export async function storeGraphSkeleton(
       ? contextOrDependencies
       : maybeDependencies;
   const client = getServiceClient(dependencies);
-  const embedding =
-    dependencies.precomputedEmbedding ??
-    (await embedDescription(parsedInput.graph.description, dependencies));
+  const graphFingerprint = createGraphIdentityFingerprint(parsedInput.graph);
 
   logInfo(
     context ?? {
@@ -444,23 +883,48 @@ export async function storeGraphSkeleton(
     "store",
     "start",
     "Starting graph skeleton store flow.",
-    { topic: parsedInput.graph.topic },
+    {
+      topic: parsedInput.graph.topic,
+      graph_identity_fingerprint: graphFingerprint,
+    },
   );
 
-  const duplicateGraphId = await recheckForDuplicateGraph(
-    parsedInput.graph,
-    embedding,
-    dependencies,
-  );
-  if (duplicateGraphId) {
+  const duplicateLookup = await recheckForDuplicateGraph(parsedInput.graph, dependencies);
+  const duplicateDecision = duplicateLookup.decision;
+  if (duplicateDecision.graph_id) {
+    logInfo(
+      context ?? {
+        requestId: "store-skeleton",
+        route: "store-skeleton",
+        startedAtMs: Date.now(),
+      },
+      "store",
+      "success",
+      "Store skeleton duplicate safeguard returned existing graph.",
+      {
+        graph_id: duplicateDecision.graph_id,
+        duplicate_reason: duplicateDecision.reason,
+        duplicate_candidate_id: duplicateDecision.candidate?.id ?? null,
+        duplicate_candidate_similarity: duplicateDecision.candidate?.similarity ?? null,
+        duplicate_candidate_flagged_for_review:
+          duplicateDecision.candidate?.flagged_for_review ?? null,
+        duplicate_threshold: RETRIEVAL_THRESHOLD,
+        duplicate_lookup_mode: duplicateDecision.lookup_mode,
+        graph_identity_fingerprint: graphFingerprint,
+      },
+    );
     return {
-      graph_id: duplicateGraphId,
-      duplicate_of_graph_id: duplicateGraphId,
+      graph_id: duplicateDecision.graph_id,
+      duplicate_of_graph_id: duplicateDecision.graph_id,
     };
   }
 
   const graphId = (dependencies.createUuid ?? randomUUID)();
   const version = await loadNextGraphVersion(client, parsedInput.graph);
+  const embedding =
+    duplicateLookup.embedding ??
+    dependencies.precomputedEmbedding ??
+    (await embedDescription(parsedInput.graph.description, dependencies));
   const nodeIdMap = new Map<string, string>();
 
   const nodeRows = parsedInput.nodes.map((node) => {
@@ -504,21 +968,21 @@ export async function storeGraphSkeleton(
     } as const;
   });
 
-  const graphStoreId = await persistGraphRows(client, {
+  const graphStoreId = await persistGraphRowsWithFallback(client, {
     graph: {
       id: graphId,
       title: parsedInput.graph.title,
       subject: parsedInput.graph.subject,
       topic: parsedInput.graph.topic,
       description: parsedInput.graph.description,
+      embedding,
       version,
       flagged_for_review: false,
-      created_at: new Date().toISOString(),
     },
     nodes: nodeRows,
     edges: edgeRows,
     embedding,
-  });
+  }, context);
 
   return {
     graph_id: graphStoreId,
@@ -548,26 +1012,57 @@ export async function updateStoredNode(
 ): Promise<Node> {
   const client = getServiceClient(dependencies);
   const normalizedP5Code = input.node.p5_code?.trim() ?? null;
+  const supportsLessonStatus = await detectDbSurfaceAvailable(
+    client,
+    STORE_FALLBACK_NODES_OPTIONAL_LESSON_STATUS_SURFACE,
+  );
+  const nodeWriteMode: NodeWriteMode = supportsLessonStatus
+    ? "with_lesson_status"
+    : "without_lesson_status";
+  const updatePayload = supportsLessonStatus
+    ? {
+        lesson_text: input.node.lesson_text,
+        static_diagram: input.node.static_diagram,
+        p5_code: normalizedP5Code,
+        visual_verified: input.node.visual_verified,
+        quiz_json: input.node.quiz_json,
+        diagnostic_questions: input.node.diagnostic_questions,
+        lesson_status: input.node.lesson_status,
+      }
+    : {
+        lesson_text: input.node.lesson_text,
+        static_diagram: input.node.static_diagram,
+        p5_code: normalizedP5Code,
+        visual_verified: input.node.visual_verified,
+        quiz_json: input.node.quiz_json,
+        diagnostic_questions: input.node.diagnostic_questions,
+      };
+  const selectClause = supportsLessonStatus
+    ? "id,graph_id,graph_version,title,lesson_text,static_diagram,p5_code,visual_verified,quiz_json,diagnostic_questions,lesson_status,position,attempt_count,pass_count"
+    : "id,graph_id,graph_version,title,lesson_text,static_diagram,p5_code,visual_verified,quiz_json,diagnostic_questions,position,attempt_count,pass_count";
 
   const { data, error } = await client
     .from("nodes")
-    .update({
-      lesson_text: input.node.lesson_text,
-      static_diagram: input.node.static_diagram,
-      p5_code: normalizedP5Code,
-      visual_verified: input.node.visual_verified,
-      quiz_json: input.node.quiz_json,
-      diagnostic_questions: input.node.diagnostic_questions,
-      lesson_status: input.node.lesson_status,
-    })
+    .update(updatePayload)
     .eq("graph_id", input.graph_id)
     .eq("id", input.node.id)
-    .select(
-      "id,graph_id,graph_version,title,lesson_text,static_diagram,p5_code,visual_verified,quiz_json,diagnostic_questions,lesson_status,position,attempt_count,pass_count",
-    )
+    .select(selectClause)
     .maybeSingle();
 
   if (error) {
+    if (isDbSchemaMismatchError(error)) {
+      throw createDbSchemaOutOfSyncError(
+        supportsLessonStatus
+          ? STORE_FALLBACK_NODES_OPTIONAL_LESSON_STATUS_SURFACE
+          : STORE_FALLBACK_NODES_REQUIRED_SURFACE,
+        error,
+        {
+          graph_id: input.graph_id,
+          node_id: input.node.id,
+          node_write_mode: nodeWriteMode,
+        },
+      );
+    }
     throw new ApiError(
       "STORE_NODE_UPDATE_FAILED",
       "Failed to persist incremental node artifacts.",
@@ -576,6 +1071,7 @@ export async function updateStoredNode(
         graph_id: input.graph_id,
         node_id: input.node.id,
         cause: error.message,
+        node_write_mode: nodeWriteMode,
       },
     );
   }
@@ -592,7 +1088,15 @@ export async function updateStoredNode(
     );
   }
 
-  return nodeSchema.parse(data);
+  const storedNode = data as unknown as Record<string, unknown>;
+
+  return nodeSchema.parse({
+    ...storedNode,
+    lesson_status:
+      "lesson_status" in storedNode && storedNode.lesson_status
+        ? storedNode.lesson_status
+        : input.node.lesson_status,
+  });
 }
 
 function mapStoreStageError(
@@ -628,6 +1132,15 @@ function mapStoreStageError(
           details: error.details as Record<string, unknown> | undefined,
           retryable: true,
         };
+      case "DB_SCHEMA_OUT_OF_SYNC":
+        return {
+          code: "STORE_GRAPH_INSERT_FAILED",
+          category: "store_failure",
+          stage: "store",
+          message: error.message,
+          details: error.details as Record<string, unknown> | undefined,
+          retryable: false,
+        };
       case "STORE_GRAPH_INSERT_FAILED":
         return {
           code: "STORE_GRAPH_INSERT_FAILED",
@@ -646,9 +1159,21 @@ function mapStoreStageError(
           details: error.details as Record<string, unknown> | undefined,
           retryable: true,
         };
+      case "STORE_PARTIAL_WRITE_PREVENTED":
+        return {
+          code: "STORE_PARTIAL_WRITE_PREVENTED",
+          category: "store_failure",
+          stage: "store",
+          message: error.message,
+          details: error.details as Record<string, unknown> | undefined,
+          retryable: false,
+        };
       default:
         return {
-          code: STORE_ERROR_CODES.unexpected_internal,
+          code:
+            error.code === "STORE_UNEXPECTED_INTERNAL"
+              ? "STORE_UNEXPECTED_INTERNAL"
+              : STORE_ERROR_CODES.unexpected_internal,
           category: "unexpected_internal",
           stage: "store",
           message: error.message,
@@ -656,6 +1181,9 @@ function mapStoreStageError(
             graph_topic: input.graph.topic,
             node_count: input.nodes.length,
             edge_count: input.edges.length,
+            ...(typeof error.details === "object" && error.details !== null
+              ? (error.details as Record<string, unknown>)
+              : {}),
           },
           retryable: false,
         };

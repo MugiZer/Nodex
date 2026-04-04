@@ -104,6 +104,24 @@ describe("deterministic structure validator", () => {
     ).toThrow(/prior knowledge/);
   });
 
+  it("does not reject adjective forms that only contain the prerequisite as a substring", () => {
+    expect(() =>
+      assertCanonicalBoundaryInvariants(
+        [
+          {
+            id: "node_1",
+            title: "Limit Laws and Algebraic Evaluation",
+            position: 1,
+          },
+        ],
+        {
+          prerequisites: ["algebra"],
+          downstream_topics: ["integral_calculus", "differential_equations", "multivariable_calculus"],
+        },
+      ),
+    ).not.toThrow();
+  });
+
   it("returns a valid result without a model dependency for structurally sound graphs", async () => {
     const result = await runStructureValidator({
       subject: "mathematics",
@@ -238,6 +256,34 @@ describe("deterministic structure validator", () => {
         expect.objectContaining({
           type: "edge_misclassification",
           nodes_involved: expect.arrayContaining(["node_1", "node_2", "node_3"]),
+        }),
+      ]),
+    );
+  });
+
+  it("flags an isolated root node instead of treating it as valid", async () => {
+    const result = await runStructureValidator({
+      subject: "mathematics",
+      topic: "algebra",
+      description:
+        "Algebra is the study of symbols and the rules for manipulating them. It encompasses expressions, equations, functions, inequalities, and factoring. It assumes prior knowledge of arithmetic and serves as a foundation for calculus, discrete mathematics, and physics. Within mathematics, it is typically encountered at the introductory level.",
+      nodes: [
+        { id: "node_1", title: "Isolated Root", position: 0 },
+        { id: "node_2", title: "Connected Root", position: 0 },
+        { id: "node_3", title: "Derived Concept", position: 1 },
+      ],
+      edges: [
+        { from_node_id: "node_2", to_node_id: "node_3", type: "hard" },
+      ],
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "orphaned_subgraph",
+          severity: "critical",
+          nodes_involved: ["node_1"],
         }),
       ]),
     );

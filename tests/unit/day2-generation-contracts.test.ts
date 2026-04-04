@@ -58,16 +58,15 @@ describe("day 2 generation contracts", () => {
   it("keeps verified p5 sketches executable by contract", () => {
     expect(() => validateDay2VisualBundle({ nodes: DAY2_VISUAL_NODES })).not.toThrow();
 
-    const verifiedNode = DAY2_VISUAL_NODES.find((node) => node.visual_verified);
-    if (!verifiedNode) {
-      throw new Error("Expected at least one verified visual node.");
-    }
+    expect(DAY2_VISUAL_NODES.every((node) => node.visual_verified)).toBe(true);
 
-    const artifact = selectNodeVisualArtifact(verifiedNode);
-    expect(artifact.kind).toBe("interactive");
-    expect(artifact.content).toContain("function setup");
-    expect(artifact.content).toContain("function draw");
-    expect(artifact.content).toContain("createCanvas(480, 320)");
+    for (const verifiedNode of DAY2_VISUAL_NODES) {
+      const artifact = selectNodeVisualArtifact(verifiedNode);
+      expect(artifact.kind).toBe("interactive");
+      expect(artifact.content).toContain("function setup");
+      expect(artifact.content).toContain("function draw");
+      expect(artifact.content).toContain("createCanvas(480, 320)");
+    }
   });
 
   it("aborts malformed provider output before store is possible", () => {

@@ -100,12 +100,14 @@ V1 policy:
 - diagnostic result may be cached client-side for the current learner session for UX continuity
 - diagnostic result does not become a persisted backend source of truth
 - persisted learner state begins when node-level `user_progress` records begin
+- route and stage code that parses DB rows must preserve parse-site attribution in errors, especially for retrieval candidates, graph rows, and user progress rows; raw schema errors are too ambiguous to diagnose when timestamps drift
 
 Practical consequences:
 
 - a learner can leave and return to the diagnostic within the same browser/session if local UI state is still available
 - cross-device diagnostic resume is not supported in V1
 - once the learner has started persisted node progress on a graph version, the app should resume from persisted progress rather than rerunning diagnostic automatically
+- the learner-scored prerequisite bundle for a resolved graph must also be mirrored to a server-side request record so lesson routes and graph reloads do not rely exclusively on client `sessionStorage`
 
 ### Diagnostic Entry Requirement
 
@@ -113,6 +115,7 @@ For a learner starting a graph version with no existing `user_progress` rows for
 
 - the diagnostic route is the required first interactive step
 - the graph may be displayed as context, but node learning should not begin until diagnostic completes
+- learner entry into a lesson route must be blocked until the target lesson resolves through the server-backed lesson resolver
 
 For a learner with existing persisted progress on that graph version:
 
@@ -272,8 +275,113 @@ Define the concrete frontend behavior for:
 - node state UX
 - diagnostic UX
 - generation/loading/failure UX
-- NodePanel behavior
+- NodeDetailPanel behavior
 - responsiveness
+
+### Demo-Optimized UI Direction
+
+The V1 learner experience is now simplified around a three-screen demo flow:
+
+1. prompt screen
+2. graph screen
+3. lesson screen
+
+This is the primary UI direction for the repo unless a later file explicitly overrides it.
+
+#### Demo Story
+
+- the learner types a prompt
+- the system builds a graph
+- the first node opens into a genuine lesson experience
+- the learner returns to the graph after completion and sees visible progression
+
+#### Screens
+
+##### 1. Prompt Screen
+
+- single centered input on a clean page
+- prompt text: `What do you want to learn?`
+- submit on enter
+- show a subtle loading message while generation runs
+- the loading state should feel like the system is thinking, not buffering
+- no intermediate confirmation screen is required when the graph is ready
+
+##### 2. Graph Screen
+
+- render the full graph with deterministic DAG layout
+- use React Flow plus a layered layout helper such as dagre
+- no physics layout
+- the graph should read top-to-bottom or left-to-right as a clear path
+- node 1 should be visually emphasized on first arrival
+- after a short pause, node 1 should auto-select and open the detail panel
+- the graph should be the only navigation surface in this screen
+
+##### 3. Lesson Screen
+
+- full-screen lesson view
+- the graph is hidden during the lesson
+- lesson content is centered and scrollable
+- no tabs, minimap, side navigation, or settings chrome
+- completion returns the learner to the graph with visible state change
+
+#### Visual Language
+
+- blue = available
+- green = completed
+- gray = pending
+- avoid red in the learner-facing demo UI
+- arrows should remain visible but secondary
+- the interface should feel clean, calm, and guided rather than dashboard-like
+
+#### Demo Transition Rules
+
+- prompt to graph: fade out the prompt and fade in the graph
+- node select: slide the right-side panel in
+- graph to lesson: crossfade into the lesson view
+- lesson complete to graph: crossfade back and reflect the updated node state
+
+#### Explicit Exclusions
+
+- no minimap
+- no visible zoom controls by default
+- no list or grid toggle
+- no tab bars in the lesson
+- no settings/profile/header navigation in the demo flow
+- no confetti or celebratory fireworks
+- no blocking skeleton screens
+
+#### Lesson Shape
+
+- the lesson should be a continuous scroll, not a tabbed interface
+- prediction trap first
+- guided insight next
+- interactive visual only if it is practical for the demo topic
+- worked example next
+- what-if question next
+- mastery check next
+- anchor and return-to-graph last
+
+#### Node State UX
+
+- available nodes should be clearly clickable
+- completed nodes should remain clickable for review
+- pending nodes should appear gray and muted
+- hovered pending nodes may show `Coming soon`
+- panel copy should stay friendly and non-gatekeeping
+
+#### Completion Feedback
+
+- completing a lesson must visibly update the graph
+- the completed node should turn green
+- newly unlocked downstream nodes should already appear available when the learner returns
+- the product moment is the graph changing because of learner action
+
+#### Implementation Notes
+
+- keep the number of learner-facing states small
+- favor CSS transitions over animation libraries
+- preserve the real learning flow even when interactive visuals are omitted or fall back
+- the demo should remain functional if the visual beat is skipped
 
 ### Route Set
 
@@ -281,9 +389,11 @@ The V1 route set is fixed to:
 
 - `app/page.tsx`
 - `app/graph/[id]/page.tsx`
-- `app/graph/[id]/diagnostic/page.tsx`
+- `app/graph/[id]/lesson/[nodeId]/page.tsx`
 
-Do not add extra frontend routes in V1 unless another file explicitly makes them necessary.
+Do not add extra learner-visible frontend routes in V1 unless another file explicitly makes them necessary.
+The demo flow has exactly three learner-visible screens: prompt, graph, and lesson.
+Any adaptive placement or recommendation work must not add a fourth screen to the demo.
 
 ### Route Responsibilities
 
@@ -294,19 +404,23 @@ Do not add extra frontend routes in V1 unless another file explicitly makes them
 - submits to `POST /api/generate`
 - routes to the selected graph after cache hit or generation success
 
-#### `app/graph/[id]/diagnostic/page.tsx`
-
-- runs the adaptive diagnostic for a learner with no persisted progress on that graph version
-- consumes node-level `diagnostic_questions`
-- displays diagnostic progress and final recommended entry point
-- transitions the learner into the graph experience when complete
-
 #### `app/graph/[id]/page.tsx`
 
 - renders the graph learning experience
 - consumes graph content plus learner progress
 - computes node states from persisted progress and graph structure
 - owns the graph + panel interaction shell
+- auto-selects the first available node after the graph appears
+- opens the right panel after a short absorb-the-graph pause
+- routes the learner into the lesson screen when they click Start lesson
+
+#### `app/graph/[id]/lesson/[nodeId]/page.tsx`
+
+- renders the full-screen lesson experience
+- hides the graph while the learner is in learning mode
+- shows the node title in a subtle top bar with a back link to the graph
+- renders the seven-beat lesson flow as one continuous scroll
+- returns the learner to the graph after completion
 
 ### Component Responsibility Map
 
@@ -317,26 +431,32 @@ Do not add extra frontend routes in V1 unless another file explicitly makes them
 - handles pan/zoom/click on graph nodes
 - never owns canonical learner progress truth
 
-#### `NodePanel`
+#### `NodeCard`
 
-- slide-in learning panel for the selected node
-- renders lesson text
-- renders visual area using `P5Sketch` or `static_diagram`
-- renders mastery quiz UI
-- owns temporary quiz interaction state only
+- custom React Flow node renderer
+- shows the colored rounded node body, title, and click target
+- reflects available, completed, and pending states
+- visually emphasizes node 1 on first arrival
 
-#### `DiagnosticFlow`
+#### `NodeDetailPanel`
 
-- client-side adaptive diagnostic controller
-- presents one diagnostic question at a time
-- tracks local answers, movement, and completion
-- computes local entry-point recommendation
+- right-side panel for the graph screen
+- shows the node title, learning objective, CTA, prerequisites, and unlocks
+- keeps the panel content sparse and demo-focused
+- does not render the full lesson
 
-#### `P5Sketch`
+#### `FlagshipLesson`
 
-- renders trusted interactive p5 code when `visual_verified = true`
-- otherwise nothing; the parent should show `static_diagram`
-- does not own fallback selection logic
+- renders the seven-beat lesson content
+- manages selection state for prediction, what-if, and mastery interactions
+- optionally renders a hand-built interactive visual for the demo topic
+- uses `renderLessonText` for all lesson copy
+
+#### `renderLessonText`
+
+- parses lesson text for `$...$`, `$$...$$`, `**...**`, `*...*`, and paragraph breaks
+- returns renderable React content
+- stays presentation-only and does not own lesson state
 
 ### Server / Client Boundary
 
@@ -344,16 +464,17 @@ Do not add extra frontend routes in V1 unless another file explicitly makes them
 
 - `app/page.tsx`
 - `app/graph/[id]/page.tsx`
-- `app/graph/[id]/diagnostic/page.tsx`
+- `app/graph/[id]/lesson/[nodeId]/page.tsx`
 
 These pages fetch initial route data on the server and pass interactive data into client components.
 
 #### Client Components
 
 - `GraphCanvas`
-- `NodePanel`
-- `DiagnosticFlow`
-- `P5Sketch`
+- `NodeCard`
+- `NodeDetailPanel`
+- `FlagshipLesson`
+- `renderLessonText`
 
 ### Data-Fetching Contract
 
@@ -365,6 +486,14 @@ These pages fetch initial route data on the server and pass interactive data int
 - `nodes`
 - `edges`
 - `progress`
+
+This payload is only trustworthy when the live DB contract matches the required read surfaces:
+
+- `graphs` rows must expose the graph read contract
+- `nodes` rows must expose the node read fields needed to deterministically derive or preserve `lesson_status` in the API payload
+- `edges` rows must expose the edge read contract
+- `user_progress` rows must expose the progress read contract
+- DB timestamps must already have been normalized through the shared DB timestamp schema before domain parsing
 
 Incremental payload rule:
 
@@ -381,12 +510,16 @@ V1 policy:
 
 #### Diagnostic Route Data
 
-`app/graph/[id]/diagnostic/page.tsx` should fetch the same graph payload shape or an equivalent server-prepared subset containing:
+The adaptive placement logic remains part of the backend/frontend data contract, but it must not surface as an extra learner-visible screen in the demo flow.
+
+`app/graph/[id]/page.tsx` should fetch the same graph payload shape or an equivalent server-prepared subset containing:
 
 - graph metadata
 - nodes with `diagnostic_questions`
 - edges if needed for movement/context
 - progress to detect whether the learner should skip diagnostic
+
+The graph screen may use this data to preselect the recommended starting node, but the learner stays on the graph screen until they choose Start lesson.
 
 #### Revalidation
 
@@ -457,7 +590,7 @@ Each rendered graph node should at least have access to:
 
 #### `active`
 
-- currently open in `NodePanel`
+- currently open in `NodeDetailPanel`
 - visually distinct from merely available
 
 #### `completed`
@@ -476,16 +609,13 @@ State precedence for rendering:
 
 ### Diagnostic UX Contract
 
-- after generation or retrieval, a learner with no persisted progress on that graph version should be sent to `/graph/[id]/diagnostic`
-- the diagnostic page explains that the system is finding the learner's entry point
-- the full interactive graph learning flow should not begin until diagnostic completes
-- a simplified graph preview or context text is acceptable, but locked/available learning interaction should begin only after diagnostic placement
-- show current question count out of the diagnostic run
-- show simple movement through the assessment, not raw scoring internals
-- when diagnostic completes, show the recommended entry point and route the learner into `/graph/[id]`
-- the graph should highlight the recommended node/state on first arrival
+- the demo must not introduce a separate learner-visible diagnostic screen
+- placement may happen before graph entry or as hidden graph-state computation, but the demo flow remains prompt -> graph -> lesson -> graph
+- the graph screen may preselect the recommended entry node on first arrival
+- the graph screen may show the available node state immediately without requiring a separate diagnostic page
 - same-session browser resume is allowed through client-local state
-- cross-device persistence of unfinished diagnostic is not supported in V1
+- cross-device persistence of unfinished placement is not supported in V1
+- the user-facing copy should talk about finding a starting point, not about scoring or assessment mechanics
 
 ### Generation / Loading / Failure States
 
@@ -516,31 +646,32 @@ Other rules:
 - non-retryable failures should show a descriptive error message and a path back to the landing page
 - missing graph id or malformed payload is a hard failure and should not navigate
 
-### NodePanel Contract
+### NodeDetailPanel Contract
 
 - panel state is client-local in V1
 - clicking an available or completed node opens the panel
 - closing the panel does not affect learner progress
-- section order:
+- the panel is graph navigation, not the lesson itself
+- panel content order:
   1. node title
-  2. lesson text
-  3. visual area
-  4. mastery quiz
-- if `visual_verified = true`, render `P5Sketch`
-- otherwise render `static_diagram`
-- broken interactive visuals must never block quiz or lesson access
-- on pass, update persisted progress and graph state
-- on fail, keep the node available and show quiz feedback
-- post-pass: mark completed, recompute graph state, highlight newly available downstream nodes if any
-- post-fail: do not close the panel automatically, allow immediate retry, keep node incomplete
+  2. one-sentence learning objective
+  3. primary CTA: Start lesson
+  4. prerequisites text
+  5. unlocks text
+- available nodes use a primary blue CTA
+- completed nodes use a secondary review CTA
+- pending nodes show friendly coming-soon copy when relevant
+- broken interactive visuals must never affect panel availability or route selection
+- panel action should route into the lesson screen for the selected node
+- the panel should stay sparse and should not grow into a dashboard
 
 ### Mobile And Responsiveness Rules
 
 - V1 is desktop-first but must remain usable on mobile
 - graph canvas supports pan/zoom
 - node labels remain readable or truncate safely
-- `NodePanel` becomes a bottom sheet or full-height overlay on narrow screens
-- diagnostic flow remains fully usable on mobile
+- `NodeDetailPanel` becomes a bottom sheet or full-height overlay on narrow screens
+- `FlagshipLesson` remains fully usable on mobile
 - the landing page remains usable on mobile
 - graph exploration may be less comfortable on small screens than on desktop, but must remain functional
 
@@ -669,6 +800,12 @@ Minimum required test scope before calling V1 complete:
   - `POST /api/generate` miss-to-store path with fixture-stubbed LLM responses
   - quiz pass/fail progress updates
   - `GET /api/graph/[id]` payload shape
+- store-boundary regression tests should be fixture-driven and replayable:
+- `app/dev-smoke-fixture.ts` owns the frozen generation-stage bundle plus the frozen exact `/api/generate/store` request fixture
+- `app/dev-smoke-bridge.tsx` still derives the live store request through `buildStoreRouteRequest(...)`, validates it with `storeRouteRequestSchema`, and posts it from the dev-only window helper
+- `tests/unit/dev-smoke-fixture.test.ts` protects raw-bundle invariants and fixture/transform parity
+- `tests/integration/store-route.test.ts` confirms the frozen exact smoke request is accepted end to end by the route
+- critical graph-read/store/retrieve tests must exercise the live DB surface probe path, not only mocked row parsing
 - at least one end-to-end happy-path flow covering:
   - anonymous sign-in
   - prompt submit
@@ -681,6 +818,7 @@ Minimum required test scope before calling V1 complete:
 Use fixture-stubbed LLM responses in automated tests.
 Do not require real Anthropic or OpenAI calls in CI.
 Real Supabase may be used in local/dev verification, but automated tests should prefer controlled fixtures or isolated test instances.
+Store-only manual smoke should reuse the frozen smoke bundle/request instead of regenerating lessons, diagnostics, or visuals on each run.
 
 ### Safety And Content Boundary Rules
 
@@ -797,6 +935,7 @@ Rules:
 - `SUPABASE_SERVICE_ROLE_KEY` is for trusted server-side Supabase access and is server-only
 - missing required env vars must fail clearly at the route or client bootstrap that needs them
 - do not silently substitute fake behavior
+- DB contract failures are distinct from env failures; missing required DB columns or RPCs must raise `DB_SCHEMA_OUT_OF_SYNC`
 
 ### Observability And Logging Contract
 

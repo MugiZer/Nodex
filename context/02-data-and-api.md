@@ -36,6 +36,28 @@ If a higher-level pack file still reopens a decision covered here, this file win
   2. unflagged over flagged
   3. higher `version`
   4. newer `created_at`
+- Runtime DB typing is sourced from `supabase/database.types.ts`; `lib/supabase.ts` aliases that generated `Database` type instead of carrying a handwritten contract block
+- Runtime DB surface checks live in `lib/server/db-contract.ts`
+- The reusable operator preflight is `npm run db:preflight`, which runs the same required-surface probes before smoke replay or deployment
+- The required live surfaces are:
+  - `graph_read.graph`
+  - `graph_read.nodes`
+  - `graph_read.edges`
+  - `graph_read.progress`
+  - `store.duplicate_recheck.graphs`
+  - `retrieve.fallback.graphs`
+- Required DB read/write surfaces must be verified in code against the live Supabase API surface, not inferred only from migrations, handwritten types, or context prose
+- If a required table column or RPC is missing from the live DB surface, fail with `DB_SCHEMA_OUT_OF_SYNC` and identify the exact surface instead of collapsing into a generic persistence/read error
+- DB-returned timestamps must use one shared exported transport schema (`dbTimestampSchema`) everywhere that reads Supabase/Postgres rows
+- Treat DB-row timestamps as a transport boundary, not as already-canonical ISO input
+- The shared DB timestamp schema normalizes verified live Supabase/PostgREST output before validation so space-separated `timestamptz` values, compact offsets, and naive row strings such as `2026-04-03T18:49:09` all converge to one canonical UTC ISO string contract before entering domain schemas
+- Public and internal non-DB timestamps must stay on the strict ISO-with-offset schema; do not reuse the DB transport schema for request bodies just because a DB row needed normalization
+- Do not introduce local `z.string().datetime()` clones for DB rows in route code, store recheck code, retrieval code, or graph-read code
+- If a DB row parse fails, report the schema name and parse phase in the thrown error details so the failing boundary is obvious from logs
+- DB readback failures should distinguish:
+  - live surface mismatch (`DB_SCHEMA_OUT_OF_SYNC`)
+  - transport parse failure
+  - ordinary persistence failure
 
 ### `flagged_for_review`
 
@@ -57,12 +79,16 @@ If a higher-level pack file still reopens a decision covered here, this file win
 - `embedding vector(1536)`
 - `version int`
 - `flagged_for_review boolean`
-- `created_at timestamp`
+- `created_at timestamptz`
 
 Notes:
 
 - The semantic retrieval surface is `subject` plus the embedded `description`
 - Versioning is stored directly on the graph row in V1
+- `created_at` is emitted from the app domain layer as canonical ISO 8601 with timezone information, but DB transport may arrive in non-canonical Supabase/PostgREST shapes first and must be normalized at the read boundary
+- `created_at` and similar DB timestamps are validated through the shared exported DB timestamp schema, not through per-file local datetime clones
+- The runtime read contract for `graphs` is enforced through `lib/server/db-contract.ts`
+- `store_generated_graph` is the preferred write RPC when the live schema exposes it; direct table writes are a fallback, not the primary contract
 
 ### `nodes`
 
@@ -83,6 +109,7 @@ Notes:
 Notes:
 
 - Nodes belong to a specific graph version
+- `lesson_status` remains part of the node API payload contract, but `GET /api/graph/[id]` may derive it deterministically from existing node artifacts when the DB row does not expose a persisted status column
 - `attempt_count` and `pass_count` are analytics counters stored on the node
 - `lesson_text`, `static_diagram`, `p5_code`, `visual_verified`, `quiz_json`, and `diagnostic_questions` are all node-level artifacts
 - `static_diagram` is the SVG fallback when an interactive visual is not trustworthy
@@ -117,6 +144,7 @@ Notes:
 - Anonymous sessions identify the learner
 - `attempts` is an append-only history of node attempts
 - `completed` is the canonical completion flag for a node
+- `user_progress` is read back through the shared graph-read contract and therefore must remain compatible with `graph_read.progress`
 
 ## Data Shapes
 
@@ -172,6 +200,7 @@ Notes:
 - Validate LLM output and apply stage-specific bounded repair before failing
 - Use descriptive error messages for parse, schema, and invariant failures
 - Server routes must not hardcode secrets or service keys
+- Lesson-route resolution must not depend exclusively on browser session state when the route is already addressable by `graph_id` and `node_id`
 
 ### `POST /api/generate/canonicalize`
 
@@ -205,6 +234,26 @@ Notes:
 - Best match `< 0.85` triggers generation
 - If multiple rows pass threshold, prefer highest similarity, then unflagged, then highest version, then newest creation time
 - If the only threshold-passing rows are flagged, return `{ graph_id: null }` for new-learner routing
+
+### `POST /api/graph/status/[requestId]/diagnostic`
+
+- Input: persisted graph diagnostic result for the request's resolved `graph_id`
+- Output: the stored graph diagnostic result
+- This route persists the learner's prerequisite bundle server-side after client-side diagnostic scoring
+- The stored bundle is keyed by the generate request record and later resolved by `graph_id`
+- This server-side bundle supplements client `sessionStorage`; it is the route-facing fallback when browser state is absent or late
+
+### `GET /api/graph/[id]/diagnostic`
+
+- Output: persisted graph diagnostic result for `graph_id`
+- This route provides the server-backed prerequisite bundle used to rebuild appended prerequisite nodes outside the original client session
+
+### `GET /api/graph/[id]/lesson/[nodeId]`
+
+- Output: `{ ready, source, node, graph_diagnostic_result }`
+- `source` is `"graph"` for persisted graph nodes and `"prerequisite"` for server-resolved prerequisite nodes
+- The route must resolve lesson content for any learner-clickable node id, including prerequisite node ids such as `gap:0:...`
+- The route is the canonical server-backed lesson resolver for lesson-page navigation and refresh safety
 
 ### `POST /api/generate/graph`
 
@@ -255,6 +304,7 @@ Notes:
 - The store step should use the service-role key on trusted server routes only
 - Store must remap all generation-time temporary node ids such as `node_1` to persisted node UUIDs before writing final node artifacts
 - Store must rewrite embedded self-references that contain node ids, including `diagnostic_questions[].node_id`, so persisted payloads never leak temporary generation ids
+- If the RPC store path is unavailable because the live schema cache cannot resolve `public.store_generated_graph`, the server may fall back to a direct table-write path that preserves the same persisted content contract rather than failing the whole generation pipeline
 - Every stage result envelope must carry `request_id`, `stage`, `duration_ms`, `attempts`, `warnings`, and structured `error` details when `ok` is false
 
 ### `POST /api/generate`

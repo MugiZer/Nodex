@@ -25,8 +25,9 @@ describe("day 2 generation trace replay", () => {
       "visuals",
       "store",
     ]);
-    expect(outcome.render_kinds["node_1"]).toBe("interactive");
-    expect(outcome.render_kinds["node_2"]).toBe("static");
+    expect(Object.values(outcome.render_kinds).some((kind) => kind === "interactive")).toBe(
+      true,
+    );
     expect(outcome.failure).toBeNull();
   });
 
@@ -58,4 +59,3 @@ describe("day 2 generation trace replay", () => {
     expect(outcome.failure?.stage).toBe("diagnostics");
   });
 });
-

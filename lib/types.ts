@@ -227,17 +227,85 @@ export type ProgressAttempt = {
 
 export type QuizItem = {
   question: string;
-  options: [string, string, string, string];
+  options: string[];
   correct_index: number;
   explanation: string;
 };
 
+export type FlagshipLessonStep = {
+  action: string;
+  result: string;
+};
+
+export type FlagshipLessonWhatIfOption = {
+  text: string;
+  isCorrect: boolean;
+  explanation: string;
+};
+
+export type FlagshipLessonMasteryOption = {
+  text: string;
+  isCorrect: boolean;
+  feedback: string;
+};
+
+export type FlagshipLesson = {
+  version: "flagship-v1";
+  predictionTrap: {
+    question: string;
+    obviousAnswer: string;
+    correctAnswer: string;
+    whyWrong: string;
+  };
+  guidedInsight: {
+    ground: string;
+    mechanism: string;
+    surprise: string;
+    reframe: string;
+  };
+  workedExample: {
+    setup: string;
+    naiveAttempt: string;
+    steps: FlagshipLessonStep[];
+    takeaway: string;
+  };
+  whatIf: {
+    question: string;
+    options: FlagshipLessonWhatIfOption[];
+  };
+  masteryCheck: {
+    stem: string;
+    options: FlagshipLessonMasteryOption[];
+    forwardHook: string;
+  };
+  anchor: {
+    summary: string;
+    bridge: string;
+  };
+};
+
 export type DiagnosticQuestion = {
   question: string;
-  options: [string, string, string, string];
+  options: string[];
   correct_index: number;
   difficulty_order: number;
   node_id: string;
+};
+
+export type PrerequisiteDiagnosticQuestion = {
+  question: string;
+  options: [string, string, string, string];
+  correctIndex: number;
+  explanation: string;
+};
+
+export type PrerequisiteDiagnosticGroup = {
+  name: string;
+  questions: [PrerequisiteDiagnosticQuestion, PrerequisiteDiagnosticQuestion];
+};
+
+export type PrerequisiteDiagnostic = {
+  prerequisites: PrerequisiteDiagnosticGroup[];
 };
 
 export type GenerationNodeDraft = {
@@ -255,6 +323,7 @@ export type GenerationGraphDraft = {
 
 export type GenerationStructureIssueType =
   | "circular_dependency"
+  | "boundary_violation"
   | "missing_hard_edge"
   | "edge_misclassification"
   | "redundant_edge"
@@ -392,7 +461,7 @@ export type LessonNode = Omit<
 > & {
   lesson_text: string;
   static_diagram: string;
-  quiz_json: [QuizItem, QuizItem, QuizItem];
+  quiz_json: QuizItem[];
 };
 
 export type GenerationLessonBundle = {
@@ -400,7 +469,7 @@ export type GenerationLessonBundle = {
 };
 
 export type DiagnosticNode = Omit<Node, "diagnostic_questions"> & {
-  diagnostic_questions: [DiagnosticQuestion];
+  diagnostic_questions: DiagnosticQuestion[];
 };
 
 export type GenerationDiagnosticBundle = {
@@ -545,9 +614,9 @@ export type DiagnosticAnswer = {
 };
 
 export type DiagnosticRunResult = {
-  start_node_id: string;
+  start_node_id: string | null;
   asked_node_ids: string[];
-  recommended_node_id: string;
+  recommended_node_id: string | null;
 };
 
 export type GenerationLogEntry = {
@@ -594,7 +663,11 @@ export type GenerateRequest = {
 };
 
 export type GenerateResponse = {
-  graph_id: string;
+  request_id: string;
+  graph_id: string | null;
+  diagnostic: PrerequisiteDiagnostic | null;
+  status: "generating" | "ready";
+  topic: string;
   cached: boolean;
 };
 
