@@ -23,21 +23,41 @@ export const supportedSubjectSchema = z.enum(SUPPORTED_SUBJECTS);
 export const edgeTypeSchema = z.enum(["hard", "soft"]);
 export const lessonStatusSchema = z.enum(["pending", "ready", "failed"]);
 
+function normalizeDbTimestamp(value: string): string {
+  let normalized = value.trim();
+
+  normalized = normalized.replace(
+    /^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?)/,
+    "$1T$2",
+  );
+
+  normalized = normalized.replace(/([+-]\d{2})$/, "$1:00");
+  normalized = normalized.replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(normalized)) {
+    normalized = `${normalized}Z`;
+  }
+
+  return normalized;
+}
+
+export const isoTimestampSchema = z.string().datetime({ offset: true });
+
+export const dbTimestampSchema = z
+  .string()
+  .transform(normalizeDbTimestamp)
+  .pipe(isoTimestampSchema);
+
 export const progressAttemptSchema = z.object({
   score: z.number().int().min(0),
-  timestamp: z.string().datetime(),
+  timestamp: dbTimestampSchema,
 });
 
-const fourOptionTupleSchema = z.tuple([
-  z.string().min(1),
-  z.string().min(1),
-  z.string().min(1),
-  z.string().min(1),
-]);
+const fourOptionArraySchema = z.array(z.string().min(1)).length(4);
 
 export const quizItemSchema = z.object({
   question: z.string().min(1),
-  options: fourOptionTupleSchema,
+  options: fourOptionArraySchema,
   correct_index: z.number().int().min(0).max(3),
   explanation: z.string().min(1),
 }).strict();
@@ -45,7 +65,7 @@ export const quizItemSchema = z.object({
 export const diagnosticQuestionSchema = z
   .object({
     question: z.string().min(1),
-    options: fourOptionTupleSchema,
+    options: fourOptionArraySchema,
     correct_index: z.number().int().min(0).max(3),
     difficulty_order: z.number().int(),
     node_id: z.string().min(1),
@@ -60,7 +80,7 @@ export const graphSchema = z.object({
   description: z.string().min(1),
   version: z.number().int().min(1),
   flagged_for_review: z.boolean(),
-  created_at: z.string().datetime(),
+  created_at: dbTimestampSchema,
 }).strict();
 
 export const nodeSchema = z.object({
@@ -101,6 +121,62 @@ export const graphPayloadSchema = z.object({
   edges: z.array(edgeSchema),
   progress: z.array(userProgressSchema),
 }).strict();
+
+export const prerequisiteDiagnosticSessionQuestionSchema = z
+  .object({
+    question: z.string().min(1),
+    options: fourOptionArraySchema,
+    correctIndex: z.number().int().min(0).max(3),
+    explanation: z.string().min(1),
+  })
+  .strict();
+
+export const prerequisiteDiagnosticSessionGroupSchema = z
+  .object({
+    name: z.string().min(1),
+    questions: z.array(prerequisiteDiagnosticSessionQuestionSchema).length(2),
+  })
+  .strict();
+
+export const storedPrerequisiteLessonSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    lesson: z.unknown(),
+  })
+  .strict();
+
+export const storedGraphDiagnosticResultSchema = z
+  .object({
+    requestId: z.string().trim().min(1),
+    graphId: z.string().uuid(),
+    topic: z.string().trim().min(1),
+    gapNames: z.array(z.string().trim().min(1)),
+    gapPrerequisites: z.array(prerequisiteDiagnosticSessionGroupSchema),
+    gapPrerequisiteLessons: z.array(storedPrerequisiteLessonSchema),
+    completedGapNodeIds: z.array(z.string().trim().min(1)),
+  })
+  .strict();
+
+export const appendedPrerequisiteNodeSchema = z
+  .object({
+    id: z.string().min(1),
+    title: z.string().min(1),
+    position: z.number().int(),
+    lesson_text: z.string().min(1),
+    isPrerequisite: z.literal(true),
+  })
+  .strict();
+
+export const graphDiagnosticRouteResponseSchema = storedGraphDiagnosticResultSchema;
+
+export const lessonResolverRouteResponseSchema = z
+  .object({
+    ready: z.boolean(),
+    source: z.enum(["graph", "prerequisite"]),
+    node: z.union([nodeSchema, appendedPrerequisiteNodeSchema]).nullable(),
+    graph_diagnostic_result: storedGraphDiagnosticResultSchema.nullable(),
+  })
+  .strict();
 
 export function validateCanonicalDescription(description: string): boolean {
   const normalized = description.replace(/\s+/g, " ").trim();
@@ -344,7 +420,7 @@ export const retrievalCandidateSchema = z.object({
   similarity: z.number().min(-1).max(1),
   flagged_for_review: z.boolean(),
   version: z.number().int().min(1),
-  created_at: z.string().datetime(),
+  created_at: dbTimestampSchema,
 }).strict();
 
 export const retrievalDecisionSchema = z
@@ -364,7 +440,7 @@ export const progressWriteRequestSchema = z.object({
   graph_id: z.string().uuid(),
   node_id: z.string().uuid(),
   score: z.number().int().min(0).max(3),
-  timestamp: z.string().datetime().optional(),
+  timestamp: isoTimestampSchema.optional(),
 }).strict();
 
 export const progressWriteResponseSchema = z.object({
@@ -386,7 +462,7 @@ export const generationEdgeDraftSchema = z.object({
 }).strict();
 
 export const generationGraphDraftSchema = z.object({
-  nodes: z.array(generationNodeDraftSchema).min(10).max(25),
+  nodes: z.array(generationNodeDraftSchema).min(4).max(25),
   edges: z.array(generationEdgeDraftSchema).min(1),
 }).strict();
 
@@ -463,6 +539,7 @@ export const generationStoreEligibilityReasonSchema = z.enum([
 
 export const generationStructureIssueTypeSchema = z.enum([
   "circular_dependency",
+  "boundary_violation",
   "missing_hard_edge",
   "edge_misclassification",
   "redundant_edge",
@@ -679,8 +756,8 @@ export const curriculumAuditRecordSchema = z
     duration_ms: z.number().int().nonnegative(),
     issue_count: z.number().int().nonnegative(),
     async_audit: z.boolean(),
-    created_at: z.string().datetime(),
-    updated_at: z.string().datetime(),
+    created_at: dbTimestampSchema,
+    updated_at: dbTimestampSchema,
   })
   .strict();
 
@@ -699,7 +776,7 @@ export const lessonNodeSchema = nodeSchema.extend({
 
 export const generationLessonBundleSchema = z
   .object({
-    nodes: z.array(lessonNodeSchema).min(10).max(25),
+    nodes: z.array(lessonNodeSchema).min(4).max(25),
   })
   .strict();
 
@@ -709,7 +786,7 @@ export const diagnosticNodeSchema = nodeSchema.extend({
 
 export const generationDiagnosticBundleSchema = z
   .object({
-    nodes: z.array(diagnosticNodeSchema).min(10).max(25),
+    nodes: z.array(diagnosticNodeSchema).min(4).max(25),
   })
   .strict();
 
@@ -729,7 +806,7 @@ export const visualNodeSchema = nodeSchema
 
 export const generationVisualBundleSchema = z
   .object({
-    nodes: z.array(visualNodeSchema).min(10).max(25),
+    nodes: z.array(visualNodeSchema).min(4).max(25),
   })
   .strict();
 
@@ -756,7 +833,7 @@ export const generateResponseSchema = z
 export const storeRequestSchema = z
   .object({
     graph: graphSchema,
-    nodes: z.array(nodeSchema).min(10).max(25),
+    nodes: z.array(nodeSchema).min(4).max(25),
     edges: z.array(edgeSchema).min(1),
   })
   .strict();
@@ -782,7 +859,7 @@ export const generationLogEntrySchema = z
     event: generationLogEventSchema,
     level: generationLogLevelSchema,
     message: z.string().min(1),
-    timestamp: z.string().datetime(),
+    timestamp: isoTimestampSchema,
     duration_ms: z.number().int().nonnegative(),
     details: z.record(z.string(), z.unknown()).nullable(),
   })
@@ -792,7 +869,7 @@ export const generationRunStateSchema = z
   .object({
     request_id: z.string().min(1),
     request_route: z.string().min(1),
-    request_started_at: z.string().datetime(),
+    request_started_at: isoTimestampSchema,
     prompt_hash: z.string().min(1),
     prompt: z.string().min(1),
     canonicalized: canonicalizeResolvedSuccessSchema.nullable(),
@@ -919,7 +996,7 @@ export const stageLogEntrySchema = z
     event: z.enum(["start", "success", "error"]),
     level: z.enum(["info", "warn", "error"]),
     message: z.string().trim().min(1),
-    timestamp: z.string().datetime(),
+    timestamp: isoTimestampSchema,
     duration_ms: z.number().int().nonnegative(),
     attempts: z.number().int().positive(),
     details: stageDetailsSchema.nullable(),

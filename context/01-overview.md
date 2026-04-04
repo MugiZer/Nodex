@@ -11,6 +11,26 @@ Foundation is an adaptive learning platform. It takes any concept, builds a know
 Core thesis: generate once, serve forever, with near-zero marginal cost per student.
 The system should feel like a real product, not a mock demo, even though the build target is hackathon-practical.
 
+## MVP Mode
+
+Foundation is currently operating in MVP/demo mode.
+
+- The immediate goal is a correct-looking, end-to-end graph and lesson flow that works reliably in live generation across multiple subjects.
+- Demo reliability is prioritized over curriculum purity when those goals conflict.
+- Learner-facing routes should prefer graceful degradation, deterministic fallback, and reduced failure risk over strict rejection of otherwise usable outputs.
+- Internal debug paths may remain stricter so structural defects are still visible during development.
+- The demo standard is practical: if the graph, lessons, diagnostics, and visuals look coherent, hold together under inspection, and do not expose visible defects, the result is acceptable for the stage demo.
+
+Current demo UI direction:
+
+- three screens only: prompt, graph, lesson
+- prompt screen is a single centered input with a lightweight thinking state
+- graph screen is a deterministic React Flow DAG with blue available nodes, green completed nodes, and gray pending nodes
+- lesson screen is a full-width, distraction-free reading experience that returns the learner to the graph on completion
+- the graph must visibly change when a node is completed
+- no red learner-facing node state in the demo flow
+- the demo flow must not introduce a separate learner-visible diagnostic screen
+
 ## Stack
 
 - Next.js App Router, TypeScript, Tailwind
@@ -56,11 +76,12 @@ Version note:
 - `app/api/generate/store/route.ts` - persistence
 - `app/page.tsx` - landing page
 - `app/graph/[id]/page.tsx` - graph view
-- `app/graph/[id]/diagnostic/page.tsx` - diagnostic flow
+- `app/graph/[id]/lesson/[nodeId]/page.tsx` - lesson view
 - `components/GraphCanvas.tsx`
-- `components/NodePanel.tsx`
-- `components/DiagnosticFlow.tsx`
-- `components/P5Sketch.tsx`
+- `components/NodeCard.tsx`
+- `components/NodeDetailPanel.tsx`
+- `components/FlagshipLesson.tsx`
+- `components/renderLessonText.tsx`
 - `app/api/generate/*` owns generation flow only; detailed prompt and schema contracts live in the later context files
 - `app/*` owns the interactive learner experience and should stay aligned with the backend contracts
 
@@ -68,11 +89,11 @@ Version note:
 
 1. Student types a prompt such as "I want to learn calculus"
 2. System canonicalizes the prompt and retrieves or generates a graph
-3. Adaptive diagnostic identifies an entry point
-4. Student clicks an available node and sees lesson plus visual
-5. Student passes quiz, node turns complete, and downstream nodes unlock
+3. Graph appears with an emphasized entry node and a right-side detail panel
+4. Student clicks Start lesson and enters the full-screen lesson
+5. Student completes the lesson, returns to the graph, and sees the node turn green
 6. Demo pitch: low generation cost, unlimited reuse
-7. The judge path must remain robust even if an interactive visual falls back to the static diagram
+7. The judge path must remain robust even if an interactive visual is omitted or falls back to the static diagram
 
 ## Environment Variables
 

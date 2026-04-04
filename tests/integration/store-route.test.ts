@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { CALCULUS_FOUNDATIONS_STORE_REQUEST } from "@/app/dev-smoke-fixture";
 import { handleStoreRequest } from "@/app/api/generate/store/route";
 
 import { DAY2_GRAPH_DRAFT, DAY2_VISUAL_NODES } from "../harness/day2-generation";
@@ -105,6 +106,33 @@ describe("POST /api/generate/store", () => {
     });
   });
 
+  it("accepts the frozen calculus smoke store request end to end", async () => {
+    const store = createStoreClient();
+    const response = await handleStoreRequest(
+      new Request("http://localhost/api/generate/store", {
+        method: "POST",
+        body: JSON.stringify(CALCULUS_FOUNDATIONS_STORE_REQUEST),
+      }),
+      {
+        precomputedEmbedding: new Array(1536).fill(0),
+        searchRetrievalCandidates: async () => [],
+        createServiceClient: () => store.client as never,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      stage: "store",
+      data: {
+        write_mode: "persisted",
+        persisted_node_count: 10,
+        persisted_edge_count: 9,
+      },
+      error: null,
+    });
+  });
+
   it("surfaces remap failures without attempting persistence", async () => {
     const store = createStoreClient();
     const response = await handleStoreRequest(
@@ -145,5 +173,42 @@ describe("POST /api/generate/store", () => {
       },
     });
     expect(store.rpc).not.toHaveBeenCalled();
+  });
+
+  it("returns duplicate_recheck_hit for exact duplicates with live naive DB timestamps", async () => {
+    const store = createStoreClient();
+    const response = await handleStoreRequest(
+      new Request("http://localhost/api/generate/store", {
+        method: "POST",
+        body: JSON.stringify(CALCULUS_FOUNDATIONS_STORE_REQUEST),
+      }),
+      {
+        precomputedEmbedding: new Array(1536).fill(0),
+        createServiceClient: () => store.client as never,
+        findExactDuplicateCandidates: async () => [
+          {
+            id: graphId,
+            similarity: 1,
+            flagged_for_review: false,
+            version: 3,
+            created_at: "2026-04-03T18:49:09",
+          },
+        ],
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      stage: "store",
+      data: {
+        graph_id: graphId,
+        duplicate_of_graph_id: graphId,
+        write_mode: "duplicate_recheck_hit",
+        persisted_node_count: 0,
+        persisted_edge_count: 0,
+      },
+      error: null,
+    });
   });
 });

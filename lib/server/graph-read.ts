@@ -4,12 +4,22 @@ import {
   type FoundationSupabaseClient,
 } from "@/lib/supabase";
 import {
+  lessonStatusSchema,
   edgeSchema,
   graphSchema,
   nodeSchema,
   userProgressSchema,
 } from "@/lib/schemas";
+import { parseSchemaOrThrow } from "@/lib/server/schema-parse";
 import type { GraphPayload } from "@/lib/types";
+import type { Database } from "@/supabase/database.types";
+import {
+  ensureDbSurfacesAvailable,
+  GRAPH_READ_EDGES_SURFACE,
+  GRAPH_READ_GRAPH_SURFACE,
+  GRAPH_READ_NODES_SURFACE,
+  GRAPH_READ_PROGRESS_SURFACE,
+} from "@/lib/server/db-contract";
 
 import { resolveAuthenticatedUserId, type AuthDependencies } from "@/lib/server/auth";
 
@@ -23,6 +33,12 @@ function getServiceClient(
 ): FoundationSupabaseClient {
   return dependencies.createServiceClient?.() ?? createSupabaseServiceRoleClient();
 }
+
+type EdgeRow = Database["public"]["Tables"]["edges"]["Row"];
+type ProgressRow = Database["public"]["Tables"]["user_progress"]["Row"];
+type NodeRow = Omit<Database["public"]["Tables"]["nodes"]["Row"], "lesson_status"> & {
+  lesson_status?: Database["public"]["Tables"]["nodes"]["Row"]["lesson_status"] | null;
+};
 
 export async function requireAuthenticatedUserId(
   request: Request,
@@ -41,10 +57,16 @@ export async function loadGraphPayload(
   }
 
   const client = getServiceClient(dependencies);
+  await ensureDbSurfacesAvailable(client, [
+    GRAPH_READ_GRAPH_SURFACE,
+    GRAPH_READ_NODES_SURFACE,
+    GRAPH_READ_EDGES_SURFACE,
+    GRAPH_READ_PROGRESS_SURFACE,
+  ]);
 
   const { data: graphRow, error: graphError } = await client
     .from("graphs")
-    .select("id,title,subject,topic,description,version,flagged_for_review,created_at")
+    .select(GRAPH_READ_GRAPH_SURFACE.select)
     .eq("id", graphId)
     .maybeSingle();
 
@@ -61,13 +83,21 @@ export async function loadGraphPayload(
     throw new ApiError("GRAPH_NOT_FOUND", "The requested graph does not exist.", 404);
   }
 
-  const graph = graphSchema.parse(graphRow);
+  const graph = parseSchemaOrThrow({
+    schema: graphSchema,
+    value: graphRow,
+    errorCode: "GRAPH_READ_FAILED",
+    message: "Failed to parse graph row returned from graphs.",
+    schemaName: "graphSchema",
+    phase: "graph_read.graph.read_parse",
+    details: {
+      graph_id: graphId,
+    },
+  });
 
   const { data: nodeRows, error: nodeError } = await client
     .from("nodes")
-    .select(
-      "id,graph_id,graph_version,title,lesson_text,static_diagram,p5_code,visual_verified,quiz_json,diagnostic_questions,lesson_status,position,attempt_count,pass_count",
-    )
+    .select(GRAPH_READ_NODES_SURFACE.select)
     .eq("graph_id", graph.id)
     .order("position", { ascending: true })
     .order("id", { ascending: true });
@@ -81,23 +111,46 @@ export async function loadGraphPayload(
     );
   }
 
-  const nodes = (nodeRows ?? []).map((nodeRow) => nodeSchema.parse(nodeRow));
-  const nodeIds = nodes.map((node) => node.id);
+  const typedNodeRows = (nodeRows ?? []) as unknown as NodeRow[];
 
-  if (nodeIds.length === 0) {
-    return {
-      graph,
-      nodes,
-      edges: [],
-      progress: [],
-    };
+  const nodes = typedNodeRows.map((nodeRow) =>
+    parseSchemaOrThrow({
+      schema: nodeSchema,
+      value: {
+        ...nodeRow,
+        lesson_status: deriveLessonStatus(nodeRow),
+      },
+      errorCode: "GRAPH_READ_FAILED",
+      message: "Failed to parse node row returned from nodes.",
+      schemaName: "nodeSchema",
+      phase: "graph_read.nodes.read_parse",
+      details: {
+        graph_id: graphId,
+        node_id:
+          typeof nodeRow === "object" && nodeRow !== null && "id" in nodeRow
+            ? String(nodeRow.id)
+            : null,
+      },
+    }),
+  );
+  if (nodes.length === 0) {
+    throw new ApiError(
+      "GRAPH_INCOMPLETE",
+      "The graph payload is incomplete: no nodes were persisted for this graph version.",
+      503,
+      {
+        graph_id: graphId,
+        graph_version: graph.version,
+      },
+    );
   }
+  const nodeIds = nodes.map((node) => node.id);
 
   const edges = await loadEdgesForNodeIds(client, nodeIds, graphId);
 
   const { data: progressRows, error: progressError } = await client
     .from("user_progress")
-    .select("id,user_id,node_id,graph_version,completed,attempts")
+    .select(GRAPH_READ_PROGRESS_SURFACE.select)
     .eq("user_id", userId)
     .eq("graph_version", graph.version)
     .in("node_id", nodeIds)
@@ -112,8 +165,20 @@ export async function loadGraphPayload(
     );
   }
 
-  const progress = (progressRows ?? []).map((progressRow) =>
-    userProgressSchema.parse(progressRow),
+  const typedProgressRows = (progressRows ?? []) as unknown as ProgressRow[];
+
+  const progress = typedProgressRows.map((progressRow) =>
+    parseSchemaOrThrow({
+      schema: userProgressSchema,
+      value: progressRow,
+      errorCode: "GRAPH_READ_FAILED",
+      message: "Failed to parse learner progress row returned from user_progress.",
+      schemaName: "userProgressSchema",
+      phase: "graph_read.progress.read_parse",
+      details: {
+        graph_id: graphId,
+      },
+    }),
   );
 
   return {
@@ -124,6 +189,26 @@ export async function loadGraphPayload(
   };
 }
 
+function deriveLessonStatus(nodeRow: NodeRow): Database["public"]["Tables"]["nodes"]["Row"]["lesson_status"] {
+  const explicitStatus = lessonStatusSchema.safeParse(nodeRow.lesson_status);
+  const hasLessonArtifacts =
+    (typeof nodeRow.lesson_text === "string" && nodeRow.lesson_text.trim().length > 0) ||
+    (typeof nodeRow.static_diagram === "string" && nodeRow.static_diagram.trim().length > 0) ||
+    (typeof nodeRow.p5_code === "string" && nodeRow.p5_code.trim().length > 0) ||
+    nodeRow.quiz_json !== null ||
+    nodeRow.diagnostic_questions !== null;
+
+  if (hasLessonArtifacts) {
+    return "ready";
+  }
+
+  if (explicitStatus.success) {
+    return explicitStatus.data;
+  }
+
+  return "pending";
+}
+
 async function loadEdgesForNodeIds(
   client: FoundationSupabaseClient,
   nodeIds: string[],
@@ -131,7 +216,7 @@ async function loadEdgesForNodeIds(
 ): Promise<GraphPayload["edges"]> {
   const { data: edgeRows, error: edgeError } = await client
     .from("edges")
-    .select("from_node_id,to_node_id,type")
+    .select(GRAPH_READ_EDGES_SURFACE.select)
     .in("from_node_id", nodeIds)
     .in("to_node_id", nodeIds);
 
@@ -144,5 +229,19 @@ async function loadEdgesForNodeIds(
     );
   }
 
-  return (edgeRows ?? []).map((edgeRow) => edgeSchema.parse(edgeRow));
+  const typedEdgeRows = (edgeRows ?? []) as unknown as EdgeRow[];
+
+  return typedEdgeRows.map((edgeRow) =>
+    parseSchemaOrThrow({
+      schema: edgeSchema,
+      value: edgeRow,
+      errorCode: "GRAPH_READ_FAILED",
+      message: "Failed to parse edge row returned from edges.",
+      schemaName: "edgeSchema",
+      phase: "graph_read.edges.read_parse",
+      details: {
+        graph_id: graphId,
+      },
+    }),
+  );
 }

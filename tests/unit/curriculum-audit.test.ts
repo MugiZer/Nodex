@@ -136,6 +136,41 @@ describe("curriculum audit", () => {
     expect(result.attemptCount).toBe(1);
   });
 
+  it("normalizes overlong detached audit fields instead of dropping the audit", async () => {
+    const context = createRequestLogContext("test curriculum audit");
+
+    const result = await runCurriculumValidator(
+      createCurriculumInput(),
+      context,
+      {
+        callModel: async () => ({
+          valid: false,
+          issues: [
+            {
+              type: "incorrect_ordering" as const,
+              severity: "major" as const,
+              nodes_involved: ["node_2"],
+              missing_concept_title: null,
+              description:
+                "This description is intentionally too long because it keeps elaborating on a curriculum issue beyond the detached audit cap and should be truncated locally instead of failing the whole audit result.",
+              suggested_fix:
+                "Shorten the fix guidance by rewriting the node ordering so foundational limit manipulation precedes this downstream skill and keep the wording concise enough for the schema.",
+              curriculum_basis:
+                "Mainstream calculus curricula expect symbolic prerequisite work to appear before application-heavy limit tasks, and this sentence is intentionally long so local normalization has to clamp it.",
+            },
+          ],
+        }),
+      },
+      { executionMode: "detached" },
+    );
+
+    expect(result.auditStatus).toBe("accepted");
+    expect(result.output.issues).toHaveLength(1);
+    expect(result.output.issues[0]?.description.length).toBeLessThanOrEqual(160);
+    expect(result.output.issues[0]?.suggested_fix.length).toBeLessThanOrEqual(140);
+    expect(result.output.issues[0]?.curriculum_basis.length).toBeLessThanOrEqual(160);
+  });
+
   it("classifies upstream timeouts without retrying detached audits", async () => {
     const context = createRequestLogContext("test curriculum audit");
 

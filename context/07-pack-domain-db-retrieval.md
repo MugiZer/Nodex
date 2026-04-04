@@ -34,6 +34,16 @@ For Pack 2 topics, this file now locks the V1 baseline for table strategy, ident
 - Graphs are shared across users and versioned
 - Progress is pinned to a graph version once the learner starts
 - Hard edges gate unlocks; soft edges are contextual only
+- DB row serialization must be treated as a transport contract that is verified in code and tests, not inferred solely from SQL column types or context prose
+- Runtime DB types are sourced from `supabase/database.types.ts`; `lib/supabase.ts` aliases that generated `Database` contract rather than maintaining a handwritten mirror
+- Runtime DB surface compatibility is guarded by `lib/server/db-contract.ts`
+- The required live surfaces are probed before parse-heavy read paths:
+  - `graph_read.graph`
+  - `graph_read.nodes`
+  - `graph_read.edges`
+  - `graph_read.progress`
+  - `store.duplicate_recheck.graphs`
+  - `retrieve.fallback.graphs`
 - The implementation must stay hackathon-practical but real
 
 ### Already-Decided Architecture Constraints
@@ -218,6 +228,7 @@ A weak answer will:
 - Supabase RLS and access rules
 - Anonymous auth behavior and how user identity maps to `user_progress`
 - Which reads and writes happen directly through Supabase versus through server routes
+- The runtime DB contract is not defined by migrations alone; it is anchored in `supabase/database.types.ts` and verified at runtime by `lib/server/db-contract.ts`
 
 ### Product Context Captured In The Source
 
@@ -227,6 +238,9 @@ A weak answer will:
 - Node attempts and completion state are recorded
 - Learner progress is pinned to a graph version
 - Hard edges are unlocking dependencies; soft edges are contextual
+- The node API contract includes `lesson_status`, but graph read may derive it deterministically from existing artifacts when the live DB row does not expose a persisted status column
+- Live schema drift on required columns/functions must surface as `DB_SCHEMA_OUT_OF_SYNC`
+- DB row parsing must preserve schema name and parse phase in errors so contract drift can be diagnosed from logs
 
 ### Platform Constraints The Pack Assumes
 
@@ -237,6 +251,9 @@ A weak answer will:
 - Public anon keys are used client-side
 - Next.js route handlers are the app integration point
 - V1 should stay minimal, but real
+- Runtime compatibility checks are executable and must not be bypassed for critical read/write surfaces
+- `store_generated_graph` is the preferred write RPC when available; direct table writes are an explicit fallback
+- `search_graph_candidates` is the preferred retrieval RPC when available; direct graph fallback is an explicit fallback path
 - Over-normalization should be avoided unless it materially improves correctness
 
 ### Inputs The Pack Assumes Exist

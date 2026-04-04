@@ -256,4 +256,53 @@ describe("Round 2 route integration", () => {
       available_node_ids: expect.arrayContaining([graphPayload.nodes[2].id]),
     });
   });
+
+  it("normalizes array-shaped progress write bodies", async () => {
+    const graphPayload: GraphPayload = JSON.parse(JSON.stringify(baseGraphPayloadFixture)) as GraphPayload;
+    const nodeId = graphPayload.nodes[1]?.id;
+    if (!nodeId) {
+      throw new Error("Fixture graph is missing the second node.");
+    }
+
+    const response = await handleProgressWriteRequest(
+      new Request("http://localhost/api/progress", {
+        method: "POST",
+        body: JSON.stringify([
+          {
+            graph_id: graphPayload.graph.id,
+            node_id: nodeId,
+            score: 3,
+            timestamp: "2026-04-01T12:22:00.000Z",
+          },
+        ]),
+      }),
+      {
+        resolveAuthenticatedUserId: async () => TEST_USER_ID,
+        recordProgressAttempt: async (
+          input: ProgressWriteRequest,
+          userId: string,
+        ): Promise<ProgressWriteResponse> => ({
+          progress: {
+            id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            user_id: userId,
+            node_id: input.node_id,
+            graph_version: 1,
+            completed: true,
+            attempts: [{ score: input.score, timestamp: input.timestamp ?? "2026-04-01T12:22:00.000Z" }],
+          },
+          available_node_ids: [graphPayload.nodes[0].id, graphPayload.nodes[1].id, graphPayload.nodes[2].id],
+          flagged_for_review: false,
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(progressWriteResponseSchema.parse(await response.json())).toMatchObject({
+      progress: {
+        node_id: nodeId,
+        completed: true,
+      },
+      available_node_ids: expect.arrayContaining([graphPayload.nodes[2].id]),
+    });
+  });
 });

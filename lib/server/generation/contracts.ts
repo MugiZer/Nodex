@@ -4,6 +4,7 @@ import {
   canonicalizeRequestSchema,
   canonicalizeSuccessSchema,
   canonicalizeResolvedSuccessSchema,
+  isoTimestampSchema,
   diagnosticQuestionSchema,
   graphSchema,
   generationEdgeDraftSchema,
@@ -49,6 +50,7 @@ export const retrievalDecisionSchema = z
 
 export const structureIssueTypeSchema = z.enum([
   "circular_dependency",
+  "boundary_violation",
   "missing_hard_edge",
   "edge_misclassification",
   "redundant_edge",
@@ -111,6 +113,46 @@ export function normalizeStructureValidatorOutput(
   });
 }
 
+const curriculumValidatorIssueModelSchema = z
+  .object({
+    type: curriculumIssueTypeSchema,
+    severity: validatorSeveritySchema,
+    nodes_involved: z.array(generationNodeDraftSchema.shape.id),
+    missing_concept_title: z.string().trim().min(1).nullable(),
+    description: z.string().trim().min(1),
+    suggested_fix: z.string().trim().min(1),
+    curriculum_basis: z.string().trim().min(1),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.type === "missing_concept") {
+      if (!value.missing_concept_title) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Missing concept issues require missing_concept_title.",
+          path: ["missing_concept_title"],
+        });
+      }
+      return;
+    }
+
+    if (value.missing_concept_title !== null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Only missing_concept issues may include missing_concept_title.",
+        path: ["missing_concept_title"],
+      });
+    }
+
+    if (value.nodes_involved.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Non-missing_concept issues must identify nodes_involved.",
+        path: ["nodes_involved"],
+      });
+    }
+  });
+
 export const curriculumValidatorIssueSchema = z
   .object({
     type: curriculumIssueTypeSchema,
@@ -154,7 +196,7 @@ export const curriculumValidatorIssueSchema = z
 export const curriculumValidatorModelOutputSchema = z
   .object({
     valid: z.boolean(),
-    issues: z.array(curriculumValidatorIssueSchema).max(3),
+    issues: z.array(curriculumValidatorIssueModelSchema).max(3),
   })
   .strict();
 
@@ -180,9 +222,21 @@ export const curriculumValidatorOutputSchema = curriculumValidatorModelOutputSch
 export function normalizeCurriculumValidatorOutput(
   value: z.infer<typeof curriculumValidatorModelOutputSchema>,
 ): CurriculumValidatorOutput {
+  const clamp = (field: string, maxLength: number): string => {
+    const normalized = field.replace(/\s+/g, " ").trim();
+    return normalized.length <= maxLength
+      ? normalized
+      : `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+  };
+
   return curriculumValidatorOutputSchema.parse({
     valid: value.issues.length === 0,
-    issues: value.issues,
+    issues: value.issues.map((issue) => ({
+      ...issue,
+      description: clamp(issue.description, 160),
+      suggested_fix: clamp(issue.suggested_fix, 140),
+      curriculum_basis: clamp(issue.curriculum_basis, 160),
+    })),
   });
 }
 
@@ -226,7 +280,7 @@ export const reconcilerResolutionSchema = z
 
 export const reconcilerOutputSchema = z
   .object({
-    nodes: z.array(generationNodeDraftSchema).min(10).max(25),
+    nodes: z.array(generationNodeDraftSchema).min(4).max(25),
     edges: z.array(generationEdgeDraftSchema).min(1),
     resolution_summary: z.array(reconcilerResolutionSchema),
   })
@@ -343,22 +397,21 @@ const stageContextSchema = z
 
 export const lessonsRouteRequestSchema = stageContextSchema
   .extend({
-    nodes: z.array(generationNodeDraftSchema).min(10).max(25),
+    nodes: z.array(generationNodeDraftSchema).min(4).max(25),
     edges: z.array(generationEdgeDraftSchema).min(1),
   })
   .strict();
 
 export const diagnosticsRouteRequestSchema = stageContextSchema
   .extend({
-    nodes: z.array(lessonEnrichedNodeSchema).min(10).max(25),
+    nodes: z.array(lessonEnrichedNodeSchema).min(4).max(25),
     edges: z.array(generationEdgeDraftSchema).min(1),
   })
   .strict();
 
 export const visualsRouteRequestSchema = stageContextSchema
   .extend({
-    nodes: z.array(diagnosticEnrichedNodeSchema).min(10).max(25),
-    edges: z.array(generationEdgeDraftSchema).min(1),
+    nodes: z.array(generationNodeDraftSchema).min(4).max(25),
   })
   .strict();
 
@@ -379,7 +432,7 @@ export const generatedNodeArtifactSchema = z
 
 export const generatedGraphArtifactSchema = z
   .object({
-    nodes: z.array(generatedNodeArtifactSchema).min(10).max(25),
+    nodes: z.array(generatedNodeArtifactSchema).min(4).max(25),
     edges: z.array(generationEdgeDraftSchema).min(1),
   })
   .strict();
@@ -416,7 +469,7 @@ export const storeGraphInputSchema = z.union([
 export const storeRouteRequestSchema = z
   .object({
     graph: storeGraphInputSchema,
-    nodes: z.array(persistedNodeArtifactSchema).min(10).max(25),
+    nodes: z.array(persistedNodeArtifactSchema).min(4).max(25),
     edges: z.array(generationEdgeDraftSchema).min(1),
   })
   .strict();
@@ -432,7 +485,7 @@ export const skeletonStoreNodeSchema = z
 export const skeletonStoreRequestSchema = z
   .object({
     graph: graphMetadataDraftSchema,
-    nodes: z.array(skeletonStoreNodeSchema).min(10).max(25),
+    nodes: z.array(skeletonStoreNodeSchema).min(4).max(25),
     edges: z.array(generationEdgeDraftSchema).min(1),
   })
   .strict();
@@ -493,10 +546,54 @@ export const storeStageResponseSchema = createStageResultEnvelopeSchema(
 
 export const generateRouteRequestSchema = canonicalizeRequestSchema;
 
+export const prerequisiteDiagnosticQuestionSchema = z
+  .object({
+    question: z.string().trim().min(1),
+    options: z.array(z.string().trim().min(1)).length(4),
+    correctIndex: z.number().int().min(0).max(3),
+    explanation: z.string().trim().min(1),
+  })
+  .strict();
+
+export const prerequisiteDiagnosticGroupSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    questions: z.array(prerequisiteDiagnosticQuestionSchema).length(2),
+  })
+  .strict();
+
+export const prerequisiteDiagnosticSchema = z
+  .object({
+    prerequisites: z.array(prerequisiteDiagnosticGroupSchema).max(5),
+  })
+  .strict();
+
 export const generateRouteResponseSchema = z
   .object({
-    graph_id: z.string().uuid(),
+    request_id: z.string().trim().min(1),
+    graph_id: z.string().uuid().nullable(),
+    diagnostic: prerequisiteDiagnosticSchema.nullable(),
+    status: z.enum(["generating", "ready"]),
+    topic: canonicalizeSuccessSchema.shape.topic,
     cached: z.boolean(),
+  })
+  .strict();
+
+export const graphStatusRouteResponseSchema = z
+  .object({
+    status: z.enum(["generating", "ready", "failed"]),
+    graph_id: z.string().uuid().nullable(),
+    prerequisite_lessons_status: z.enum(["pending", "ready", "failed"]),
+    prerequisite_lessons: z
+      .array(
+        z
+          .object({
+            name: z.string().trim().min(1),
+            lesson: z.unknown(),
+          })
+          .strict(),
+      )
+      .nullable(),
   })
   .strict();
 
@@ -514,7 +611,7 @@ export const generationLogEntrySchema = z
     event: z.enum(["start", "success", "error", "retry"]),
     level: z.enum(["info", "warn", "error"]),
     message: z.string().trim().min(1),
-    timestamp: z.string().datetime(),
+    timestamp: isoTimestampSchema,
     duration_ms: z.number().int().nonnegative(),
     failure_category: generationFailureCategorySchema.optional(),
     details: z.record(z.string(), z.unknown()).nullable().optional(),
@@ -525,7 +622,7 @@ export const generationRunStateSchema = z
   .object({
     request_id: z.string().trim().min(1),
     request_route: z.string().trim().min(1),
-    request_started_at: z.string().datetime(),
+    request_started_at: isoTimestampSchema,
     prompt_hash: z.string().trim().min(1),
     prompt: z.string().trim().min(1),
     canonicalized: canonicalizeResolvedSuccessSchema.nullable(),
@@ -582,6 +679,8 @@ export type StoreRouteRequest = z.infer<typeof storeRouteRequestSchema>;
 export type StoreRouteResponse = z.infer<typeof storeRouteResponseSchema>;
 export type StoreStageData = z.infer<typeof storeStageDataSchema>;
 export type GenerateRouteResponse = z.infer<typeof generateRouteResponseSchema>;
+export type PrerequisiteDiagnostic = z.infer<typeof prerequisiteDiagnosticSchema>;
+export type GraphStatusRouteResponse = z.infer<typeof graphStatusRouteResponseSchema>;
 export type GenerationFailureCategory = z.infer<typeof generationFailureCategorySchema>;
 export type GenerationRunState = z.infer<typeof generationRunStateSchema>;
 export type SkeletonStoreRequest = z.infer<typeof skeletonStoreRequestSchema>;

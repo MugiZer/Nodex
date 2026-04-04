@@ -30,7 +30,7 @@ export async function generateVisualsStage(
         request_id: context.requestId,
         code: "VISUALS_INPUT_INVALID",
         message:
-          "Expected body with subject, topic, description, and nodes for visuals.",
+          "Expected body with subject, topic, description, and graph nodes for visuals.",
         details: parsed.error.flatten(),
       }),
     );
@@ -45,11 +45,7 @@ export async function generateVisualsStage(
           subject: parsed.data.subject,
           topic: parsed.data.topic,
           description: parsed.data.description,
-          nodes: parsed.data.nodes.map((node) => ({
-            id: node.id,
-            title: node.title,
-            position: node.position,
-          })),
+          nodes: parsed.data.nodes,
         },
         context,
         dependencies,

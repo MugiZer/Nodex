@@ -5,7 +5,7 @@ This file captures the two content-generation prompts that sit after graph recon
 - `POST /api/generate/visuals`
 - `POST /api/generate/diagnostics`
 
-The visual stage enriches final lesson nodes with `p5_code` and `visual_verified`.
+The visual stage deterministically enriches final lesson nodes with `p5_code` and `visual_verified`.
 The diagnostic stage enriches final nodes with exactly one placement question each.
 
 ## Ownership Note
@@ -19,20 +19,18 @@ The diagnostic stage enriches final nodes with exactly one placement question ea
 
 ### Purpose
 
-Generate an interactive p5.js sketch only when the interaction genuinely improves intuition for the node.
+Render an interactive p5.js sketch only when the interaction genuinely improves intuition for the node.
+The server chooses from a bounded template catalog and renders the sketch deterministically.
+If no trustworthy sketch is appropriate, the route falls back to `static_diagram`.
 
 ### Input Assumptions
 
 - The graph is already final and validated
-- The lesson content is already final
-- Each node already contains:
-  - `lesson_text`
-  - `static_diagram`
-  - `quiz_json`
-- `static_diagram` is the fallback visual asset for nodes that should not receive a trustworthy interactive sketch
-- This prompt does not create `static_diagram`; it only consumes it
-- The visual prompt only needs the graph's subject, topic, description, and the node list with `id`, `title`, and `position`
-- The visual prompt must not carry lesson bundles, diagnostic bundles, or the full edge list
+- The visual stage only needs the graph's `subject`, `topic`, `description`, and node list with `id`, `title`, and `position`
+- `static_diagram` remains the fallback artifact owned by lessons and consumed by the visual renderer
+- The route does not need lesson bundles, diagnostic bundles, or the full edge list
+- The renderer should not depend on prior model output for code generation
+- If the node does not map cleanly to a template, the correct output is a static fallback
 
 ### Output Shape
 
@@ -46,13 +44,17 @@ type VisualOutput = {
 };
 ```
 
-### Visual System Prompt Rules
+### Visual Rendering Rules
 
 - Treat the visual as an enhancement, not the primary lesson
 - Prefer simple, stable, deterministic sketches
 - Use interactivity only when it clarifies the node concept
-- If the concept is better served by the static diagram, return no interactive sketch
-- If unsure, fall back to `p5_code: ""` and `visual_verified: false`
+- If the concept is better served by the static diagram, return `p5_code: ""` and `visual_verified: false`
+- The current implementation is deterministic and model-free
+- `visual_verified` must mean the visual passed deterministic policy checks, not merely that a template matched by title
+- Deterministic policy verification must at minimum check concept-family match, subject/topic eligibility, and node-title alignment before marking `visual_verified: true`
+- If those policy checks are not satisfied, the route must emit the static fallback instead of stretching template coverage
+- Smoke fixtures now freeze a generation-stage bundle plus the exact store request derived from it, so diagnostic and visual outputs must stay stable enough to replay the same store payload without regenerating content
 - Never change curriculum, titles, or graph structure
 - Do not build a full application around the sketch
 - Do not combine multiple downstream concepts into one visual
@@ -101,10 +103,13 @@ If `p5_code` contains any content:
 - it must not contain `loadJSON(`
 - it must not contain `loadFont(`
 
-### Visual Retry Rules
+### Visual Guardrails
 
-- If output fails JSON parsing or schema checks, retry once with identical input
-- If output still fails, surface a descriptive error listing violated invariants
+- The renderer must never emit raw code inside JSON from an LLM on the happy path
+- Template selection should be deterministic from the node metadata and topic context
+- Topic context is part of verification, not just template lookup
+- If a template cannot produce a trustworthy sketch, the route should emit a static fallback instead of inventing a sketch
+- If a new template violates the invariants, fix the template or fall back, do not make the route depend on model retries
 
 ## Diagnostic Question Prompt
 
@@ -147,6 +152,7 @@ type DiagnosticOutput = {
 - Generate exactly one diagnostic question for each node
 - Keep the question short, discriminative, and answerable quickly
 - Target the node's central concept, not downstream applications
+- The dev smoke fixture uses node-specific, realistic placement questions rather than placeholder scaffolding so replayed store requests still reflect the same one-question-per-node contract
 - Avoid trick wording and unnecessary computation unless the node itself is procedural
 - Use the question to distinguish "understands this node" from "does not yet understand this node"
 - Do not create mastery-style mini-exams
@@ -182,6 +188,7 @@ Duplicate question text across nodes is not allowed unless the node titles are e
 - The visual stage is an enhancement stage, not a replacement for the lesson or the static SVG
 - The diagnostic stage is a placement stage, not the mastery quiz
 - If the interactive visual is not trustworthy, fallback to the static diagram instead of blocking the graph
+- The visual route accepts the graph draft node metadata, not diagnostic node output
 
 ## Alignment Note
 

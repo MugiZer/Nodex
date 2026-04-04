@@ -2,6 +2,16 @@
 
 This file is the authoritative lower-level reference for pipeline sequencing, stage ownership, adaptive diagnostic flow, unlock behavior, and visual fallback.
 
+## MVP Operating Mode
+
+The live product path is currently optimized for demo reliability.
+
+- `POST /api/generate` should prefer returning a usable graph skeleton plus solid lessons and visuals over failing on repairable or non-critical purity defects.
+- The primary live-product risk to reduce is visible failure during generation, not minor hidden curriculum drift.
+- Strict validation still matters, but strict failure should be concentrated in debug and development-oriented graph routes when possible.
+- When the system can repair or safely simplify a graph without inventing misleading topic content, it should do that instead of surfacing a learner-facing error.
+- A stable end-to-end graph for multiple subjects is more important than perfect topic-boundary purity in the live demo path.
+
 ## Master Pipeline Order
 
 1. `POST /api/generate/canonicalize`
@@ -27,9 +37,14 @@ This file is the authoritative lower-level reference for pipeline sequencing, st
 - `POST /api/generate/diagnostics` returns a stage result envelope whose `data` carries nodes enriched with `diagnostic_questions`
 - `POST /api/generate/visuals` returns a stage result envelope whose `data` carries nodes with `p5_code` and `visual_verified`
 - `POST /api/generate/store` returns a stage result envelope whose `data` carries `{ graph_id, duplicate_of_graph_id?, write_mode, remapped_node_count, persisted_node_count, persisted_edge_count }`
+- If the live Supabase schema cache does not resolve `public.store_generated_graph`, the store stage may fall back to direct table writes while preserving the same persisted node and edge contract
 - `POST /api/generate/enrich` returns `{ graph_id, request_id, selected_node_ids, processed_node_ids, ready_node_ids, failed_node_ids, remaining_pending_node_ids }`
 - `POST /api/generate` returns `{ graph_id, cached }`
 - `GET /api/graph/[id]` returns `{ graph, nodes, edges, progress }`
+- `POST /api/graph/status/[requestId]/diagnostic` stores the learner-scored prerequisite bundle on the server for the resolved graph
+- `GET /api/graph/[id]/diagnostic` returns the server-backed prerequisite bundle for graph rehydration
+- `GET /api/graph/[id]/lesson/[nodeId]` resolves persisted and prerequisite lesson nodes through one server-backed contract
+- `GET /api/graph/[id]` and the store duplicate recheck / retrieval fallback paths all probe the live DB surface before parsing rows; a missing required column or function is a schema contract failure, not a content failure
 
 ## Graph Pipeline Ownership
 
@@ -50,6 +65,11 @@ If it times out or fails contract validation, the detached audit still records t
 The curriculum validator and deterministic structure validation are independent, and the reconciler only sees the original graph plus both accepted validator outputs when those outputs are available synchronously.
 Every stage output is machine-validated before the next stage runs.
 The server may apply deterministic graph normalization and deterministic local repair before escalating to the LLM reconciler, as long as those steps remain mechanical and do not invent new topic content.
+- In MVP mode, `POST /api/generate` may allow repairable generator defects to proceed into deterministic repair or reconciler stages instead of failing immediately, while `POST /api/generate/graph` remains the stricter debugging surface.
+- In MVP mode, live generation may fall back to a simpler deterministic DAG when a generated graph cannot be repaired safely enough for the demo path.
+- In MVP mode, parsed-but-imperfect live graph drafts should be treated as repair candidates: top-level shape failures remain fatal, but structural defects should be sanitized, validated, and repaired instead of aborting the request.
+- In MVP mode, incremental enrichment is fail-soft: malformed lessons or diagnostics should persist `null` artifacts and keep the node pending, while broken visuals remain non-blocking and should fall back without interrupting learner flow.
+- In MVP mode, `POST /api/generate` may also degrade canonicalization to a deterministic fallback after a bounded draft timeout plus invalid repair output, while `POST /api/generate/canonicalize` remains the strict debugging surface for canonicalize contract failures.
 
 ## Stage Ownership
 
@@ -57,7 +77,16 @@ The server may apply deterministic graph normalization and deterministic local r
 - `lessons` owns `lesson_text`, `quiz_json`, and `static_diagram`
 - `diagnostics` owns `diagnostic_questions`
 - `visuals` owns `p5_code` and `visual_verified`
+- The visuals route consumes graph draft node metadata and deterministically selects a template or fallback from that node context
 - `store` persists the skeleton immediately after reconciliation and later persists per-node enrichment updates against the stored node UUIDs
+- Store inputs and DB-returned rows do not share the same timestamp contract.
+- Store-route request bodies and internal orchestration timestamps stay on the strict ISO-with-offset schema.
+- DB-returned rows in duplicate recheck, retrieval, graph read, and curriculum audit paths use the shared DB timestamp schema, which normalizes verified Supabase/PostgREST transport shapes before those values enter domain schemas.
+- The runtime DB row type source is `supabase/database.types.ts`; `lib/supabase.ts` aliases that generated contract instead of maintaining a separate handwritten table model.
+- Live surface verification is centralized in `lib/server/db-contract.ts` and must be used whenever a critical route depends on a required Supabase table, column, or RPC.
+- Manual smoke replay and deployment should call the shared preflight gate (`npm run db:preflight`) before graph readback or store replay starts
+- Required DB surfaces now follow a latest-schema policy, but `lesson_status` is no longer part of the required live `graph_read.nodes` surface. Graph read derives `lesson_status` deterministically when the column is absent so the API payload stays stable for the demo path.
+- The store duplicate recheck path must use a parse helper that adds schema name and phase details to DB-row parse failures; do not let raw Zod issues escape without parse-site context.
 - Stages 7 through 10 must emit one shared typed result envelope with searchable `code`, broad `category`, `retryable`, and structured `details` on failure, plus warnings for non-blocking conditions such as visual fallback
 
 ## Retrieval and Cache Behavior
@@ -129,10 +158,11 @@ LIMIT 1;
 1. Student types "I want to learn calculus"
 2. System canonicalizes and retrieves or generates a graph
 3. Adaptive diagnostic runs and graph illuminates with an entry point
-4. Student clicks an available node and sees lesson plus visual
-5. Student passes quiz and the node turns green
-6. Next node unlocks
-7. Demo pitch emphasizes low generation cost and unlimited reuse
+4. The client persists the prerequisite bundle server-side and blocks lesson entry until the target node resolves through the lesson resolver
+5. Student clicks an available node and sees lesson plus visual
+6. Student passes quiz and the node turns green
+7. Next node unlocks
+8. Demo pitch emphasizes low generation cost and unlimited reuse
 
 ## Auth and Progress Snapshot
 

@@ -1,6 +1,6 @@
 import { ApiError } from "@/lib/errors";
 import type { RequestLogContext } from "@/lib/logging";
-import { logError, logInfo } from "@/lib/logging";
+import { logError, logInfo, logWarn } from "@/lib/logging";
 import type {
   CanonicalBoundaryFields,
   CanonicalizeSuccess,
@@ -49,8 +49,45 @@ const CURRICULUM_VALIDATOR_TIMEOUT_MS = computeStageTimeout(CURRICULUM_VALIDATOR
 const RECONCILER_TIMEOUT_MS = computeStageTimeout(RECONCILER_MAX_TOKENS);
 
 type GraphStageDependencies<TOutput> = LlmStageDependencies<TOutput>;
+type GraphDraftValidationMode = "strict" | "demo";
+type StructureAuditMode = "strict" | "demo";
+type BoundaryPolicy = {
+  prerequisite: "error";
+  downstream: "error" | "warn";
+};
+type GraphDraftSanitizationWarning =
+  | {
+      kind: "duplicate_node_id_renamed";
+      original_id: string;
+      replacement_id: string;
+    }
+  | {
+      kind: "dangling_edge_dropped";
+      from_node_id: string;
+      to_node_id: string;
+      edge_type: "hard" | "soft";
+    }
+  | {
+      kind: "self_loop_dropped";
+      node_id: string;
+      edge_type: "hard" | "soft";
+    };
+type BoundaryViolation = {
+  kind: "prerequisite" | "downstream";
+  node_id: string;
+  title: string;
+  prerequisite?: string;
+  downstream_topic?: string;
+  match_mode: "token" | "phrase" | "token_set";
+  matched_tokens: string[];
+};
 type ReconcilerRunOutput = ReconcilerOutput & {
   repair_mode: GraphReconciliationMode;
+  boundary_warnings?: BoundaryViolation[];
+};
+const STRICT_BOUNDARY_POLICY: BoundaryPolicy = {
+  prerequisite: "error",
+  downstream: "error",
 };
 
 type GraphContextInput = CanonicalizeSuccess;
@@ -306,19 +343,19 @@ function assertGraphStateInvariants(
       (edge) => edge.from_node_id === node.id || edge.to_node_id === node.id,
     );
 
-    if (node.position > 0 && !hasIncomingHardEdge) {
+    if (!participatesInEdges) {
       throw new ApiError(
         "LLM_OUTPUT_INVALID",
-        `${stage} failed state validation: graph returned a non-root node without an incoming hard edge.`,
+        `${stage} failed state validation: graph returned an isolated node.`,
         502,
         { node_id: node.id },
       );
     }
 
-    if (!participatesInEdges) {
+    if (node.position > 0 && !hasIncomingHardEdge) {
       throw new ApiError(
         "LLM_OUTPUT_INVALID",
-        `${stage} failed state validation: graph returned an isolated node.`,
+        `${stage} failed state validation: graph returned a non-root node without an incoming hard edge.`,
         502,
         { node_id: node.id },
       );
@@ -338,6 +375,32 @@ function assertGraphDraftInvariants(
   return normalizedNodes;
 }
 
+function normalizeRepairWorkingGraph(
+  nodes: GenerationNodeDraft[],
+  edges: GenerationEdgeDraft[],
+  stage: string,
+): { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] } {
+  assertGraphShapeInvariants(nodes, edges, stage);
+  let normalizedNodes = nodes;
+
+  try {
+    normalizedNodes = recomputePositionsFromHardEdges(nodes, edges, stage);
+    assertGraphSemanticInvariants(normalizedNodes, edges, stage);
+  } catch (error) {
+    if (
+      !(error instanceof ApiError) ||
+      !error.message.includes("cyclic hard-edge dependency chain")
+    ) {
+      throw error;
+    }
+  }
+
+  return {
+    nodes: normalizedNodes,
+    edges,
+  };
+}
+
 function dedupeExactEdges(edges: GenerationEdgeDraft[]): GenerationEdgeDraft[] {
   const deduped = new Map<string, GenerationEdgeDraft>();
 
@@ -349,6 +412,72 @@ function dedupeExactEdges(edges: GenerationEdgeDraft[]): GenerationEdgeDraft[] {
   }
 
   return [...deduped.values()];
+}
+
+function sanitizeGraphDraftForDemo(
+  nodes: GenerationNodeDraft[],
+  edges: GenerationEdgeDraft[],
+): {
+  nodes: GenerationNodeDraft[];
+  edges: GenerationEdgeDraft[];
+  warnings: GraphDraftSanitizationWarning[];
+} {
+  const warnings: GraphDraftSanitizationWarning[] = [];
+  const seenNodeIds = new Set<string>();
+  let maxNumericId = Math.max(
+    0,
+    ...nodes.map((node) => Number.parseInt(node.id.replace("node_", ""), 10)).filter(Number.isFinite),
+  );
+
+  const sanitizedNodes = nodes.map((node) => {
+    if (!seenNodeIds.has(node.id)) {
+      seenNodeIds.add(node.id);
+      return node;
+    }
+
+    maxNumericId += 1;
+    const replacementId = `node_${maxNumericId}`;
+    warnings.push({
+      kind: "duplicate_node_id_renamed",
+      original_id: node.id,
+      replacement_id: replacementId,
+    });
+    seenNodeIds.add(replacementId);
+    return {
+      ...node,
+      id: replacementId,
+    };
+  });
+
+  const validNodeIds = new Set(sanitizedNodes.map((node) => node.id));
+  const sanitizedEdges = dedupeExactEdges(edges).filter((edge) => {
+    if (edge.from_node_id === edge.to_node_id) {
+      warnings.push({
+        kind: "self_loop_dropped",
+        node_id: edge.from_node_id,
+        edge_type: edge.type,
+      });
+      return false;
+    }
+
+    if (!validNodeIds.has(edge.from_node_id) || !validNodeIds.has(edge.to_node_id)) {
+      warnings.push({
+        kind: "dangling_edge_dropped",
+        from_node_id: edge.from_node_id,
+        to_node_id: edge.to_node_id,
+        edge_type: edge.type,
+      });
+      return false;
+    }
+
+    return true;
+  });
+
+  return {
+    nodes: sanitizedNodes,
+    edges: sanitizedEdges,
+    warnings,
+  };
 }
 
 function pruneRedundantHardEdges(edges: GenerationEdgeDraft[]): GenerationEdgeDraft[] {
@@ -373,7 +502,45 @@ function normalizeGraphDraftDeterministically(
   nodes: GenerationNodeDraft[],
   edges: GenerationEdgeDraft[],
   stage: string,
-): { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] } {
+  mode: GraphDraftValidationMode = "strict",
+): {
+  nodes: GenerationNodeDraft[];
+  edges: GenerationEdgeDraft[];
+  warnings: GraphDraftSanitizationWarning[];
+} {
+  if (mode === "demo") {
+    const sanitized = sanitizeGraphDraftForDemo(nodes, edges);
+    const prunedEdges = pruneRedundantHardEdges(sanitized.edges);
+
+    try {
+      const normalizedNodes = recomputePositionsFromHardEdges(sanitized.nodes, prunedEdges, stage);
+      const validatedNodes = assertGraphDraftInvariants(normalizedNodes, prunedEdges, stage);
+
+      return {
+        nodes: validatedNodes,
+        edges: prunedEdges,
+        warnings: sanitized.warnings,
+      };
+    } catch (error) {
+      if (error instanceof ApiError) {
+        let normalizedNodes = sanitized.nodes;
+        try {
+          normalizedNodes = recomputePositionsFromHardEdges(sanitized.nodes, prunedEdges, `${stage}_demo`);
+        } catch {
+          normalizedNodes = sanitized.nodes;
+        }
+
+        return {
+          nodes: normalizedNodes,
+          edges: prunedEdges,
+          warnings: sanitized.warnings,
+        };
+      }
+
+      throw error;
+    }
+  }
+
   assertUniqueNodeIds(nodes, stage);
   assertNodeReferencesExist(nodes, edges, stage);
 
@@ -385,6 +552,29 @@ function normalizeGraphDraftDeterministically(
   return {
     nodes: validatedNodes,
     edges: prunedEdges,
+    warnings: [],
+  };
+}
+
+export function buildFallbackDagFromDraft(
+  nodes: GenerationNodeDraft[],
+): { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] } {
+  const orderedNodes = [...nodes]
+    .sort((left, right) => left.position - right.position || left.id.localeCompare(right.id))
+    .map((node, index) => ({
+      ...node,
+      position: index,
+    }));
+
+  const edges = orderedNodes.slice(1).map((node, index) => ({
+    from_node_id: orderedNodes[index]?.id ?? node.id,
+    to_node_id: node.id,
+    type: "hard" as const,
+  }));
+
+  return {
+    nodes: orderedNodes,
+    edges,
   };
 }
 
@@ -539,37 +729,62 @@ function anchorTokens(value: string): string[] {
   return meaningfulTokens(value).filter((token) => !CONCEPT_GENERIC_TOKENS.has(token));
 }
 
-function conceptMatchesTitle(concept: string, title: string): boolean {
+type BoundaryMatch = {
+  mode: "token" | "phrase" | "token_set";
+  matched_tokens: string[];
+};
+
+function findBoundaryMatch(concept: string, title: string): BoundaryMatch | null {
   const normalizedConcept = normalizeConceptLabel(concept);
   const normalizedTitle = normalizeConceptLabel(title);
   const conceptTokens = anchorTokens(concept);
 
   if (normalizedConcept.length === 0 || normalizedTitle.length === 0) {
-    return false;
+    return null;
   }
 
   if (conceptTokens.length === 0) {
-    return false;
+    return null;
   }
 
-  if (
-    normalizedTitle.includes(normalizedConcept) ||
-    normalizedConcept.includes(normalizedTitle)
-  ) {
-    return true;
-  }
-
-  const nodeTitleTokens = new Set(meaningfulTokens(title));
-
-  if (nodeTitleTokens.size === 0) {
-    return false;
-  }
+  const titleTokens = meaningfulTokens(title);
 
   if (conceptTokens.length === 1) {
-    return nodeTitleTokens.has(conceptTokens[0]!);
+    const [token] = conceptTokens;
+    if (token && titleTokens.includes(token)) {
+      return {
+        mode: "token",
+        matched_tokens: [token],
+      };
+    }
+
+    return null;
   }
 
-  return conceptTokens.some((token) => nodeTitleTokens.has(token));
+  const phrasePattern = new RegExp(
+    `(^| )${conceptTokens.map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(" ")}( |$)`,
+  );
+  if (phrasePattern.test(normalizedTitle)) {
+    return {
+      mode: "phrase",
+      matched_tokens: conceptTokens,
+    };
+  }
+
+  const nodeTitleTokens = new Set(titleTokens);
+
+  if (nodeTitleTokens.size === 0) {
+    return null;
+  }
+
+  if (conceptTokens.every((token) => nodeTitleTokens.has(token))) {
+    return {
+      mode: "token_set",
+      matched_tokens: conceptTokens,
+    };
+  }
+
+  return null;
 }
 
 function buildHardAdjacency(edges: GenerationEdgeDraft[]): Map<string, string[]> {
@@ -720,7 +935,7 @@ function buildIncomingEdgesByNode(
 }
 
 function runDeterministicStructureValidation(
-  input: GraphStructureInput,
+  input: GraphStructureInput & CanonicalBoundaryFields,
 ): StructureValidatorOutput {
   const issues: GenerationStructureIssue[] = [];
   const seenIssueKeys = new Set<string>();
@@ -772,6 +987,20 @@ function runDeterministicStructureValidation(
   const maxPosition = Math.max(...input.nodes.map((node) => node.position));
 
   for (const node of input.nodes) {
+    const participatesInEdges = input.edges.some(
+      (edge) => edge.from_node_id === node.id || edge.to_node_id === node.id,
+    );
+
+    if (!participatesInEdges) {
+      pushIssue({
+        type: "orphaned_subgraph",
+        severity: "critical",
+        nodes_involved: [node.id],
+        description: "An isolated node does not participate in any prerequisite path.",
+        suggested_fix: "Connect the node into the graph or remove it so every node participates in at least one edge.",
+      });
+    }
+
     const incomingEdges = incomingEdgesByNode.get(node.id) ?? [];
     const hardIncomingEdges = incomingEdges.filter((edge) => edge.type === "hard");
     const softIncomingEdges = incomingEdges.filter((edge) => edge.type === "soft");
@@ -909,6 +1138,38 @@ function runDeterministicStructureValidation(
     });
   }
 
+  for (const node of input.nodes) {
+    for (const prerequisite of input.prerequisites ?? []) {
+      const match = findBoundaryMatch(prerequisite, node.title);
+      if (!match) {
+        continue;
+      }
+
+      pushIssue({
+        type: "boundary_violation",
+        severity: "major",
+        nodes_involved: [node.id],
+        description: `The graph includes assumed prior knowledge "${prerequisite}" as node content via ${match.mode} boundary matching.`,
+        suggested_fix: "Rename, split, or remove the node so the graph starts after the declared prerequisite boundary.",
+      });
+    }
+
+    for (const downstreamTopic of input.downstream_topics ?? []) {
+      const match = findBoundaryMatch(downstreamTopic, node.title);
+      if (!match) {
+        continue;
+      }
+
+      pushIssue({
+        type: "boundary_violation",
+        severity: "major",
+        nodes_involved: [node.id],
+        description: `The graph includes downstream topic "${downstreamTopic}" as node content via ${match.mode} boundary matching.`,
+        suggested_fix: "Rename, split, or remove the node so the graph stays within the canonical topic boundary.",
+      });
+    }
+  }
+
   return {
     valid: issues.length === 0,
     issues,
@@ -965,6 +1226,8 @@ function assertResolutionSummaryCoverage(
 
 function createDeterministicResolutionAction(issue: GenerationStructureIssue): string {
   switch (issue.type) {
+    case "boundary_violation":
+      return "Removed a node that fell outside the canonical topic boundary and recomputed positions.";
     case "redundant_edge":
       return "Removed a redundant hard edge and recomputed positions.";
     case "missing_hard_edge":
@@ -973,9 +1236,37 @@ function createDeterministicResolutionAction(issue: GenerationStructureIssue): s
       return "Demoted one over-constraining hard prerequisite to soft and recomputed positions.";
     case "position_inconsistency":
       return "Recomputed positions from the hard-edge DAG.";
+    case "circular_dependency":
+      return "Demoted one hard edge in the cycle to soft and recomputed positions.";
     default:
       return "Applied deterministic graph normalization and revalidated the graph.";
   }
+}
+
+function repairBoundaryViolationIssue(
+  nodes: GenerationNodeDraft[],
+  edges: GenerationEdgeDraft[],
+  issue: GenerationStructureIssue,
+): { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] } | null {
+  if (issue.type !== "boundary_violation" || issue.nodes_involved.length !== 1) {
+    return null;
+  }
+
+  const [nodeId] = issue.nodes_involved;
+  if (!nodeId || !nodes.some((node) => node.id === nodeId)) {
+    return null;
+  }
+
+  if (nodes.length - 1 < 4) {
+    return null;
+  }
+
+  return {
+    nodes: nodes.filter((node) => node.id !== nodeId),
+    edges: edges.filter(
+      (edge) => edge.from_node_id !== nodeId && edge.to_node_id !== nodeId,
+    ),
+  };
 }
 
 function repairEdgeMisclassificationMinorIssue(
@@ -1049,82 +1340,364 @@ function repairEdgeMisclassificationMinorIssue(
   );
 }
 
+function repairRootFanInEdgeMisclassificationIssue(
+  nodes: GenerationNodeDraft[],
+  edges: GenerationEdgeDraft[],
+  issue: GenerationStructureIssue,
+): GenerationEdgeDraft[] | null {
+  if (issue.type !== "edge_misclassification") {
+    return null;
+  }
+
+  const issueNodeIds = new Set(issue.nodes_involved);
+  const nodeById = createNodeMap(nodes);
+  const candidateTargetNode = nodes.find((node) => {
+    if (!issueNodeIds.has(node.id) || node.position <= 0) {
+      return false;
+    }
+
+    const issueIncomingHardEdges = edges.filter(
+      (edge) =>
+        edge.type === "hard" &&
+        edge.to_node_id === node.id &&
+        issueNodeIds.has(edge.from_node_id),
+    );
+
+    return (
+      issueIncomingHardEdges.length >= 2 &&
+      issueIncomingHardEdges.every(
+        (edge) => (nodeById.get(edge.from_node_id)?.position ?? -1) === 0,
+      )
+    );
+  });
+
+  if (!candidateTargetNode) {
+    return null;
+  }
+
+  const incomingHardEdges = edges
+    .filter(
+      (edge) =>
+        edge.type === "hard" &&
+        edge.to_node_id === candidateTargetNode.id &&
+        issueNodeIds.has(edge.from_node_id),
+    )
+    .sort((left, right) => left.from_node_id.localeCompare(right.from_node_id));
+
+  const retainedEdge = incomingHardEdges[0];
+  if (!retainedEdge || incomingHardEdges.length < 2) {
+    return null;
+  }
+
+  return edges.map((edge) => {
+    const shouldDemote =
+      edge.type === "hard" &&
+      edge.to_node_id === candidateTargetNode.id &&
+      issueNodeIds.has(edge.from_node_id) &&
+      !(
+        edge.from_node_id === retainedEdge.from_node_id &&
+        edge.to_node_id === retainedEdge.to_node_id
+      );
+
+    return shouldDemote ? { ...edge, type: "soft" as const } : edge;
+  });
+}
+
+function repairCircularDependencyIssue(
+  edges: GenerationEdgeDraft[],
+  issue: GenerationStructureIssue,
+): GenerationEdgeDraft[] | null {
+  if (issue.type !== "circular_dependency" || issue.nodes_involved.length < 2) {
+    return null;
+  }
+
+  const cycleNodeIds = issue.nodes_involved;
+  const cycleEdgeKeys = new Set<string>();
+  for (let index = 0; index < cycleNodeIds.length; index += 1) {
+    const fromNodeId = cycleNodeIds[index];
+    const toNodeId = cycleNodeIds[(index + 1) % cycleNodeIds.length];
+    if (!fromNodeId || !toNodeId) {
+      continue;
+    }
+    cycleEdgeKeys.add(`${fromNodeId}::${toNodeId}`);
+  }
+
+  const candidateEdges = edges
+    .filter(
+      (edge) => edge.type === "hard" && cycleEdgeKeys.has(`${edge.from_node_id}::${edge.to_node_id}`),
+    )
+    .sort((left, right) => {
+      const leftKey = `${left.from_node_id}::${left.to_node_id}`;
+      const rightKey = `${right.from_node_id}::${right.to_node_id}`;
+      return leftKey.localeCompare(rightKey);
+    });
+
+  const edgeToDemote = candidateEdges.at(-1);
+  if (!edgeToDemote) {
+    return null;
+  }
+
+  return edges.map((edge) =>
+    edge.type === "hard" &&
+    edge.from_node_id === edgeToDemote.from_node_id &&
+    edge.to_node_id === edgeToDemote.to_node_id
+      ? { ...edge, type: "soft" as const }
+      : edge,
+  );
+}
+
+function repairOrphanedSubgraphIssue(
+  nodes: GenerationNodeDraft[],
+  edges: GenerationEdgeDraft[],
+  issue: GenerationStructureIssue,
+): { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] } | null {
+  if (issue.type !== "orphaned_subgraph" || issue.nodes_involved.length === 0) {
+    return null;
+  }
+
+  const orphanedNodeIds = new Set(issue.nodes_involved);
+  if (![...orphanedNodeIds].some((nodeId) => nodes.some((node) => node.id === nodeId))) {
+    return null;
+  }
+
+  if (nodes.length - orphanedNodeIds.size < 4) {
+    return null;
+  }
+
+  return {
+    nodes: nodes.filter((node) => !orphanedNodeIds.has(node.id)),
+    edges: edges.filter(
+      (edge) =>
+        !orphanedNodeIds.has(edge.from_node_id) &&
+        !orphanedNodeIds.has(edge.to_node_id),
+    ),
+  };
+}
+
 function applyDeterministicStructureRepairs(
   nodes: GenerationNodeDraft[],
   edges: GenerationEdgeDraft[],
   issues: GenerationStructureIssue[],
-): { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] } {
-  let nextEdges = dedupeExactEdges(edges);
+  boundaries: CanonicalBoundaryFields,
+  maxIterations = 12,
+): {
+  nodes: GenerationNodeDraft[];
+  edges: GenerationEdgeDraft[];
+  resolvedIssues: GenerationStructureIssue[];
+  remainingIssues: GenerationStructureIssue[];
+  iterations: number;
+} {
+  let currentGraph = normalizeRepairWorkingGraph(
+    nodes,
+    dedupeExactEdges(edges),
+    "reconcile_local_repair",
+  );
+  const resolvedIssues = new Map<string, GenerationStructureIssue>();
+  let currentIssues: GenerationStructureIssue[] = issues;
+  let iterations = 0;
 
-  for (const issue of issues) {
-    if (issue.type === "redundant_edge" && issue.nodes_involved.length >= 2) {
-      const [fromNodeId, toNodeId] = issue.nodes_involved;
-      nextEdges = nextEdges.filter(
-        (edge) =>
-          !(
-            edge.type === "hard" &&
+  while (iterations < maxIterations) {
+    iterations += 1;
+    currentIssues = runDeterministicStructureValidation({
+      nodes: currentGraph.nodes,
+      edges: currentGraph.edges,
+      prerequisites: boundaries.prerequisites,
+      downstream_topics: boundaries.downstream_topics,
+    }).issues;
+
+    let changed = false;
+
+    const prioritizedIssues = [...currentIssues].sort((left, right) => {
+      const priority = (issue: GenerationStructureIssue): number => {
+        switch (issue.type) {
+          case "boundary_violation":
+            return 0;
+          case "orphaned_subgraph":
+            return 1;
+          case "redundant_edge":
+            return 2;
+          case "missing_hard_edge":
+            return 3;
+          case "edge_misclassification":
+            return 4;
+          case "position_inconsistency":
+            return 5;
+          case "circular_dependency":
+          default:
+            return 6;
+        }
+      };
+
+      return priority(left) - priority(right);
+    });
+
+    for (const issue of prioritizedIssues) {
+      const issueKey = createStructureCoverageIssueKey(issue);
+      let nextGraph: { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] } | null = null;
+
+      const boundaryPruned = repairBoundaryViolationIssue(
+        currentGraph.nodes,
+        currentGraph.edges,
+        issue,
+      );
+      if (boundaryPruned) {
+        nextGraph = boundaryPruned;
+      } else {
+        const orphanPruned = repairOrphanedSubgraphIssue(
+          currentGraph.nodes,
+          currentGraph.edges,
+          issue,
+        );
+        if (orphanPruned) {
+          nextGraph = orphanPruned;
+        }
+      }
+
+      if (!nextGraph && issue.type === "redundant_edge" && issue.nodes_involved.length >= 2) {
+        const [fromNodeId, toNodeId] = issue.nodes_involved;
+        nextGraph = {
+          nodes: currentGraph.nodes,
+          edges: currentGraph.edges.filter(
+            (edge) =>
+              !(
+                edge.type === "hard" &&
+                edge.from_node_id === fromNodeId &&
+                edge.to_node_id === toNodeId
+              ),
+          ),
+        };
+      } else if (!nextGraph && issue.type === "missing_hard_edge" && issue.nodes_involved.length >= 2) {
+        const [fromNodeId, toNodeId] = issue.nodes_involved;
+        nextGraph = {
+          nodes: currentGraph.nodes,
+          edges: currentGraph.edges.map((edge) =>
+            edge.type === "soft" &&
             edge.from_node_id === fromNodeId &&
             edge.to_node_id === toNodeId
+              ? { ...edge, type: "hard" as const }
+              : edge,
           ),
-      );
-      continue;
-    }
-
-    if (issue.type === "missing_hard_edge" && issue.nodes_involved.length >= 2) {
-      const [fromNodeId, toNodeId] = issue.nodes_involved;
-      nextEdges = nextEdges.map((edge) =>
-        edge.type === "soft" &&
-        edge.from_node_id === fromNodeId &&
-        edge.to_node_id === toNodeId
-          ? {
-              ...edge,
-              type: "hard" as const,
+        };
+      } else if (!nextGraph) {
+        const repairedMinorEdges = repairEdgeMisclassificationMinorIssue(
+          currentGraph.nodes,
+          currentGraph.edges,
+          issue,
+        );
+        if (repairedMinorEdges) {
+          nextGraph = { nodes: currentGraph.nodes, edges: repairedMinorEdges };
+        } else {
+          const repairedFanInEdges = repairRootFanInEdgeMisclassificationIssue(
+            currentGraph.nodes,
+            currentGraph.edges,
+            issue,
+          );
+          if (repairedFanInEdges) {
+            nextGraph = { nodes: currentGraph.nodes, edges: repairedFanInEdges };
+          } else {
+            const repairedCircularEdges = repairCircularDependencyIssue(currentGraph.edges, issue);
+            if (repairedCircularEdges) {
+              nextGraph = { nodes: currentGraph.nodes, edges: repairedCircularEdges };
             }
-          : edge,
+          }
+        }
+      } else if (issue.type === "redundant_edge" && issue.nodes_involved.length >= 2) {
+        // no-op: handled in guarded branches above
+      }
+
+      if (!nextGraph) {
+        continue;
+      }
+
+      currentGraph = normalizeRepairWorkingGraph(
+        nextGraph.nodes,
+        nextGraph.edges,
+        "reconcile_local_repair",
       );
-      continue;
+      resolvedIssues.set(issueKey, issue);
+      changed = true;
+      break;
     }
 
-    const repairedEdgeSet = repairEdgeMisclassificationMinorIssue(nodes, nextEdges, issue);
-    if (repairedEdgeSet) {
-      nextEdges = repairedEdgeSet;
+    if (!changed) {
+      break;
     }
   }
 
-  return normalizeGraphDraftDeterministically(nodes, nextEdges, "reconcile_local_repair");
+  currentIssues = runDeterministicStructureValidation({
+    nodes: currentGraph.nodes,
+    edges: currentGraph.edges,
+    prerequisites: boundaries.prerequisites,
+    downstream_topics: boundaries.downstream_topics,
+  }).issues;
+
+  return {
+    nodes: currentGraph.nodes,
+    edges: currentGraph.edges,
+    resolvedIssues: [...resolvedIssues.values()],
+    remainingIssues: currentIssues,
+    iterations,
+  };
 }
 
 export function assertCanonicalBoundaryInvariants(
   nodes: GenerationNodeDraft[],
   boundaries: CanonicalBoundaryFields | undefined,
-): void {
+  policy: BoundaryPolicy = STRICT_BOUNDARY_POLICY,
+): BoundaryViolation[] {
   if (!boundaries?.prerequisites && !boundaries?.downstream_topics) {
-    return;
+    return [];
   }
+
+  const downstreamWarnings: BoundaryViolation[] = [];
 
   for (const node of nodes) {
     for (const prerequisite of boundaries.prerequisites ?? []) {
-      if (conceptMatchesTitle(prerequisite, node.title)) {
+      const match = findBoundaryMatch(prerequisite, node.title);
+      if (match) {
         throw new ApiError(
           "GRAPH_BOUNDARY_VIOLATION",
           "reconcile failed deterministic validation: graph includes assumed prior knowledge as a node.",
           422,
-          { node_id: node.id, title: node.title, prerequisite },
+          {
+            node_id: node.id,
+            title: node.title,
+            prerequisite,
+            match_mode: match.mode,
+            matched_tokens: match.matched_tokens,
+          },
         );
       }
     }
 
     for (const downstreamTopic of boundaries.downstream_topics ?? []) {
-      if (conceptMatchesTitle(downstreamTopic, node.title)) {
+      const match = findBoundaryMatch(downstreamTopic, node.title);
+      if (match) {
+        const violation: BoundaryViolation = {
+          kind: "downstream",
+          node_id: node.id,
+          title: node.title,
+          downstream_topic: downstreamTopic,
+          match_mode: match.mode,
+          matched_tokens: match.matched_tokens,
+        };
+
+        if (policy.downstream === "warn") {
+          downstreamWarnings.push(violation);
+          continue;
+        }
+
         throw new ApiError(
           "GRAPH_BOUNDARY_VIOLATION",
           "reconcile failed deterministic validation: graph includes a downstream topic as a node.",
           422,
-          { node_id: node.id, title: node.title, downstream_topic: downstreamTopic },
+          violation,
         );
       }
     }
   }
+
+  return downstreamWarnings;
 }
 
 function buildGraphGeneratorSystemPrompt(): string {
@@ -1133,10 +1706,11 @@ function buildGraphGeneratorSystemPrompt(): string {
     "Return only raw JSON.",
     "Generate a topic-scoped knowledge dependency DAG for the canonicalized concept.",
     "Output shape: {\"nodes\":[{\"id\":\"node_1\",\"title\":\"...\",\"position\":0}],\"edges\":[{\"from_node_id\":\"node_1\",\"to_node_id\":\"node_2\",\"type\":\"hard\"}]}",
-    "Rules: 10 to 25 nodes, atomic concepts, no cycles, no self-loops, unique node ids, at least one position-0 node, every non-root node has at least one incoming hard edge, hard edges must go from lower position to higher position, and no isolated nodes.",
+    "Rules: 4 to 25 nodes, atomic concepts, no cycles, no self-loops, unique node ids, at least one position-0 node, every non-root node has at least one incoming hard edge, hard edges must go from lower position to higher position, and no isolated nodes.",
     "Hard prerequisites must be sufficient on their own, soft edges are contextual only, and transitive hard edges should be omitted unless they add distinct non-gating context.",
     "Prefer fewer cleaner hard edges over dense fan-in, and avoid creating capstones that depend on immediate prior concepts only through soft edges.",
     "Do not include assumed prior knowledge or downstream topics as graph nodes.",
+    "Respect explicit prerequisite and downstream-topic boundary lists when they are provided.",
     "The server will deterministically normalize positions, prune duplicate edges, and remove redundant hard edges before reconciliation, so do not rely on later repair to fix avoidable structure mistakes.",
   ].join(" ");
 }
@@ -1147,17 +1721,30 @@ function buildValidatorGraphPayload(input: {
   description: string;
   nodes: GenerationNodeDraft[];
   edges: GenerationEdgeDraft[];
-}): string {
-  return [
+} & Partial<CanonicalBoundaryFields>): string {
+  const sections = [
     `Subject: ${input.subject}`,
     `Topic: ${input.topic}`,
     `Description: ${input.description}`,
+  ];
+
+  if (input.prerequisites && input.prerequisites.length > 0) {
+    sections.push(`Prerequisites: ${serializeCompactJson(input.prerequisites)}`);
+  }
+
+  if (input.downstream_topics && input.downstream_topics.length > 0) {
+    sections.push(`Downstream topics: ${serializeCompactJson(input.downstream_topics)}`);
+  }
+
+  sections.push(
     "Graph JSON:",
     serializeJson({
       nodes: input.nodes,
       edges: input.edges,
     }),
-  ].join("\n\n");
+  );
+
+  return sections.join("\n\n");
 }
 
 function buildStructureValidatorSystemPrompt(): string {
@@ -1270,6 +1857,8 @@ function buildReconcilerSystemPrompt(): string {
     "You are the Foundation reconciler.",
     "Return only raw JSON.",
     "Repair the graph with minimal drift while resolving structure and curriculum issues.",
+    "Respect explicit prerequisite and downstream-topic boundary lists when they are provided.",
+    "Boundary violation issues mean the graph currently includes assumed prior knowledge or downstream material as nodes and those nodes must be renamed, split, or removed.",
     "Preserve existing node ids when nodes remain.",
     "If new nodes are required, use the next available node_N id.",
     "Recompute positions to match final hard prerequisite order.",
@@ -1284,6 +1873,7 @@ function buildReconcilerRepairSystemPrompt(): string {
     "Return only raw JSON.",
     "Repair the reconciler output so it satisfies every deterministic graph invariant.",
     "Preserve graph meaning with the smallest possible drift.",
+    "Respect explicit prerequisite and downstream-topic boundary lists when they are provided.",
     "Every hard edge must go from lower position to higher position.",
     "The graph must remain acyclic, have at least one position-0 node, give every non-root node an incoming hard edge, and contain no isolated nodes.",
     "Do not explain your reasoning outside the JSON schema.",
@@ -1356,37 +1946,61 @@ function assertReconcilerOutput(
     structure: StructureValidatorOutput;
     curriculum: CurriculumValidatorOutput;
     curriculumAuditStatus: CurriculumAuditStatus;
+    boundaryPolicy?: BoundaryPolicy;
   } & CanonicalBoundaryFields,
-): void {
+): BoundaryViolation[] {
   output.nodes = assertGraphDraftInvariants(output.nodes, output.edges, "reconcile");
-    if (input) {
-      const finalStructureValidation = runDeterministicStructureValidation({
-        nodes: output.nodes,
-        edges: output.edges,
-      });
-    if (finalStructureValidation.issues.length > 0) {
+  if (input) {
+    const boundaryWarnings = assertCanonicalBoundaryInvariants(
+      output.nodes,
+      {
+        prerequisites: input.prerequisites,
+        downstream_topics: input.downstream_topics,
+      },
+      input.boundaryPolicy ?? STRICT_BOUNDARY_POLICY,
+    );
+
+    const finalStructureValidation = runDeterministicStructureValidation({
+      nodes: output.nodes,
+      edges: output.edges,
+      prerequisites: input.prerequisites,
+      downstream_topics: input.downstream_topics,
+    });
+    const unresolvedStructureIssues = finalStructureValidation.issues.filter(
+      (issue) => issue.type !== "boundary_violation",
+    );
+    if (unresolvedStructureIssues.length > 0) {
       throw new ApiError(
         "LLM_CONTRACT_VIOLATION",
         "reconcile failed deterministic validation: final graph still has unresolved structure issues.",
         502,
         {
-          issue_keys: finalStructureValidation.issues.map(createStructureCoverageIssueKey),
+          issue_keys: unresolvedStructureIssues.map(createStructureCoverageIssueKey),
+          issues: unresolvedStructureIssues,
         },
       );
     }
     assertResolutionSummaryCoverage(output, input);
-    assertCanonicalBoundaryInvariants(output.nodes, {
-      prerequisites: input.prerequisites,
-      downstream_topics: input.downstream_topics,
-    });
+    return boundaryWarnings;
   }
+
+  return [];
 }
 
 export async function runGraphGenerator(
   input: GraphContextInput,
   context?: RequestLogContext,
   dependencies: GraphStageDependencies<{ nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] }> = {},
+  options: { validationMode?: GraphDraftValidationMode } = {},
 ): Promise<{ nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] }> {
+  const validationMode = options.validationMode ?? "strict";
+  const logContext =
+    context ??
+    ({
+      requestId: "graph_generate",
+      route: "graph_generate",
+      startedAtMs: Date.now(),
+    } satisfies RequestLogContext);
   const output = await executeLlmStage({
     stage: "graph_generate",
     systemPrompt: buildGraphGeneratorSystemPrompt(),
@@ -1395,6 +2009,8 @@ export async function runGraphGenerator(
       `Subject: ${input.subject}`,
       `Topic: ${input.topic}`,
       `Description: ${input.description}`,
+      `Prerequisites: ${serializeCompactJson(input.prerequisites)}`,
+      `Downstream topics: ${serializeCompactJson(input.downstream_topics)}`,
     ].join("\n"),
     schema: generationGraphDraftSchema,
     failureCategory: "llm_output_invalid",
@@ -1405,19 +2021,53 @@ export async function runGraphGenerator(
     dependencies,
   });
 
-  return normalizeGraphDraftDeterministically(
+  const normalized = normalizeGraphDraftDeterministically(
     output.nodes,
     output.edges,
     "graph_generate",
+    validationMode,
   );
+  if (validationMode === "demo" && normalized.warnings.length > 0) {
+    logWarn(
+      logContext,
+      "graph_generate",
+      "success",
+      "Sanitized structural graph draft defects in demo mode.",
+      {
+        validation_mode: validationMode,
+        warning_count: normalized.warnings.length,
+        warnings: normalized.warnings,
+      },
+    );
+  }
+  const cycleNodeIds = findHardCycleNodeIds(normalized.nodes, normalized.edges);
+  if (validationMode === "demo" && cycleNodeIds.length > 0) {
+    logWarn(logContext, "graph_generate", "success", "Accepted cyclic generator draft for downstream repair in demo mode.", {
+      validation_mode: validationMode,
+      nodes_involved: cycleNodeIds,
+    });
+  }
+  return {
+    nodes: normalized.nodes,
+    edges: normalized.edges,
+  };
 }
 
 export async function runStructureValidator(
   input: GraphContextInput & { nodes: GenerationNodeDraft[]; edges: GenerationEdgeDraft[] },
   context?: RequestLogContext,
   dependencies: GraphStageDependencies<StructureValidatorOutput> = {},
+  options: {
+    auditMode?: StructureAuditMode;
+  } = {},
 ): Promise<StructureValidatorOutput> {
-  const deterministicOutput = runDeterministicStructureValidation(input);
+  const auditMode = options.auditMode ?? "strict";
+  const deterministicOutput = runDeterministicStructureValidation({
+    nodes: input.nodes,
+    edges: input.edges,
+    prerequisites: input.prerequisites,
+    downstream_topics: input.downstream_topics,
+  });
   const logContext =
     context ??
     ({
@@ -1440,25 +2090,43 @@ export async function runStructureValidator(
     return deterministicOutput;
   }
 
-  const rawOutput = await executeLlmStage({
-    stage: "structure_validate",
-    systemPrompt: buildStructureValidatorSystemPrompt(),
-    userPrompt: buildValidatorGraphPayload(input),
-    schema: structureValidatorModelOutputSchema,
-    failureCategory: "llm_contract_violation",
-    timeoutMs: STRUCTURE_VALIDATOR_TIMEOUT_MS,
-    maxTokens: STRUCTURE_VALIDATOR_MAX_TOKENS,
-    temperature: 0,
-    context,
-    dependencies,
-  });
+  let modelOutput: StructureValidatorOutput | null = null;
+  try {
+    const rawOutput = await executeLlmStage({
+      stage: "structure_validate",
+      systemPrompt: buildStructureValidatorSystemPrompt(),
+      userPrompt: buildValidatorGraphPayload(input),
+      schema: structureValidatorModelOutputSchema,
+      failureCategory: "llm_contract_violation",
+      timeoutMs: STRUCTURE_VALIDATOR_TIMEOUT_MS,
+      maxTokens: STRUCTURE_VALIDATOR_MAX_TOKENS,
+      temperature: 0,
+      context,
+      dependencies,
+    });
 
-  const modelOutput = normalizeStructureValidatorOutput(rawOutput);
-  assertValidatorNodeReferences(input.nodes, modelOutput, "structure_validate");
+    modelOutput = normalizeStructureValidatorOutput(rawOutput);
+    assertValidatorNodeReferences(input.nodes, modelOutput, "structure_validate");
+  } catch (error) {
+    if (auditMode !== "demo") {
+      throw error;
+    }
+
+    logWarn(
+      logContext,
+      "structure_validate",
+      "success",
+      "Optional model structure audit failed in demo mode; using deterministic output only.",
+      {
+        audit_mode: auditMode,
+        failure: error instanceof Error ? error.message : String(error),
+      },
+    );
+  }
 
   const mergedOutput = structureValidatorOutputSchema.parse({
-    valid: deterministicOutput.issues.length === 0 && modelOutput.issues.length === 0,
-    issues: mergeStructureIssues(deterministicOutput.issues, modelOutput.issues),
+    valid: deterministicOutput.issues.length === 0 && (modelOutput?.issues.length ?? 0) === 0,
+    issues: mergeStructureIssues(deterministicOutput.issues, modelOutput?.issues ?? []),
   });
 
   logInfo(
@@ -1469,7 +2137,7 @@ export async function runStructureValidator(
     {
       audit_mode: "deterministic_plus_model",
       deterministic_issue_count: deterministicOutput.issues.length,
-      model_issue_count: modelOutput.issues.length,
+      model_issue_count: modelOutput?.issues.length ?? 0,
       merged_issue_count: mergedOutput.issues.length,
     },
   );
@@ -1616,6 +2284,7 @@ export async function runReconciler(
     structure: StructureValidatorOutput;
     curriculum: CurriculumValidatorOutput;
     curriculumAuditStatus: CurriculumAuditStatus;
+    boundaryPolicy?: BoundaryPolicy;
   },
   context?: RequestLogContext,
   dependencies: GraphStageDependencies<ReconcilerOutput> = {},
@@ -1628,20 +2297,24 @@ export async function runReconciler(
       startedAtMs: Date.now(),
     } satisfies RequestLogContext);
 
-  const locallyRepairedGraph = applyDeterministicStructureRepairs(
+  const deterministicRepair = applyDeterministicStructureRepairs(
     input.nodes,
     input.edges,
     input.structure.issues,
+    {
+      prerequisites: input.prerequisites,
+      downstream_topics: input.downstream_topics,
+    },
   );
-  const remainingStructure = runDeterministicStructureValidation({
-    nodes: locallyRepairedGraph.nodes,
-    edges: locallyRepairedGraph.edges,
+  const remainingStructure = structureValidatorOutputSchema.parse({
+    valid: deterministicRepair.remainingIssues.length === 0,
+    issues: deterministicRepair.remainingIssues,
   });
 
   const remainingStructureIssueKeys = new Set(
     remainingStructure.issues.map(createStructureCoverageIssueKey),
   );
-  const deterministicResolutionSummary = input.structure.issues
+  const deterministicResolutionSummary = deterministicRepair.resolvedIssues
     .filter(
       (issue) => !remainingStructureIssueKeys.has(createStructureCoverageIssueKey(issue)),
     )
@@ -1655,11 +2328,11 @@ export async function runReconciler(
   if (remainingStructure.issues.length === 0 && input.curriculum.issues.length === 0) {
     const deterministicRepairApplied = input.structure.issues.length > 0;
     const deterministicOutput = reconcilerOutputSchema.parse({
-      nodes: locallyRepairedGraph.nodes,
-      edges: locallyRepairedGraph.edges,
+      nodes: deterministicRepair.nodes,
+      edges: deterministicRepair.edges,
       resolution_summary: deterministicResolutionSummary,
     });
-    assertReconcilerOutput(deterministicOutput, {
+    const boundaryWarnings = assertReconcilerOutput(deterministicOutput, {
       description: input.description,
       subject: input.subject,
       topic: input.topic,
@@ -1668,7 +2341,15 @@ export async function runReconciler(
       curriculumAuditStatus: input.curriculumAuditStatus,
       prerequisites: input.prerequisites,
       downstream_topics: input.downstream_topics,
+      boundaryPolicy: input.boundaryPolicy,
     });
+    if (boundaryWarnings.length > 0) {
+      logWarn(logContext, "reconcile", "success", "Accepted downstream boundary leakage under demo policy.", {
+        boundary_policy: input.boundaryPolicy?.downstream ?? "error",
+        warning_count: boundaryWarnings.length,
+        warnings: boundaryWarnings,
+      });
+    }
     const fastPathMessage =
       deterministicRepairApplied
         ? "Reconcile completed with deterministic local repair only."
@@ -1684,6 +2365,7 @@ export async function runReconciler(
           : "deterministic_only",
         curriculum_audit_status: input.curriculumAuditStatus,
         resolution_count: deterministicOutput.resolution_summary.length,
+        deterministic_repair_iterations: deterministicRepair.iterations,
       },
     );
     return {
@@ -1691,13 +2373,14 @@ export async function runReconciler(
       repair_mode: graphReconciliationModeSchema.parse(
         deterministicRepairApplied ? "deterministic_only_repaired" : "deterministic_only",
       ),
+      boundary_warnings: boundaryWarnings,
     };
   }
 
   const reconcilerInput = {
     ...input,
-    nodes: locallyRepairedGraph.nodes,
-    edges: locallyRepairedGraph.edges,
+    nodes: deterministicRepair.nodes,
+    edges: deterministicRepair.edges,
     structure: remainingStructure,
   };
 
@@ -1741,22 +2424,35 @@ export async function runReconciler(
   });
 
   try {
-      assertReconcilerOutput(combinedOutput, {
-        description: input.description,
-        subject: input.subject,
-        topic: input.topic,
-        structure: remainingStructure,
-        curriculum: input.curriculum,
-        curriculumAuditStatus: input.curriculumAuditStatus,
-        prerequisites: input.prerequisites,
-        downstream_topics: input.downstream_topics,
+    const boundaryWarnings = assertReconcilerOutput(combinedOutput, {
+      description: input.description,
+      subject: input.subject,
+      topic: input.topic,
+      structure: remainingStructure,
+      curriculum: input.curriculum,
+      curriculumAuditStatus: input.curriculumAuditStatus,
+      prerequisites: input.prerequisites,
+      downstream_topics: input.downstream_topics,
+      boundaryPolicy: input.boundaryPolicy,
+    });
+    if (boundaryWarnings.length > 0) {
+      logWarn(logContext, "reconcile", "success", "Accepted downstream boundary leakage under demo policy.", {
+        boundary_policy: input.boundaryPolicy?.downstream ?? "error",
+        warning_count: boundaryWarnings.length,
+        warnings: boundaryWarnings,
       });
-      return {
-        ...combinedOutput,
-        repair_mode: graphReconciliationModeSchema.parse("llm_reconcile"),
-      };
+    }
+    return {
+      ...combinedOutput,
+      repair_mode: graphReconciliationModeSchema.parse("llm_reconcile"),
+      boundary_warnings: boundaryWarnings,
+    };
   } catch (error) {
     if (!(error instanceof ApiError)) {
+      throw error;
+    }
+
+    if (error.code === "GRAPH_BOUNDARY_VIOLATION") {
       throw error;
     }
 
@@ -1803,29 +2499,44 @@ export async function runReconciler(
     });
 
     try {
-        assertReconcilerOutput(combinedRepairedOutput, {
-          description: input.description,
-          subject: input.subject,
-          topic: input.topic,
-          structure: remainingStructure,
-          curriculum: input.curriculum,
-          curriculumAuditStatus: input.curriculumAuditStatus,
-          prerequisites: input.prerequisites,
-          downstream_topics: input.downstream_topics,
+      const boundaryWarnings = assertReconcilerOutput(combinedRepairedOutput, {
+        description: input.description,
+        subject: input.subject,
+        topic: input.topic,
+        structure: remainingStructure,
+        curriculum: input.curriculum,
+        curriculumAuditStatus: input.curriculumAuditStatus,
+        prerequisites: input.prerequisites,
+        downstream_topics: input.downstream_topics,
+        boundaryPolicy: input.boundaryPolicy,
+      });
+      if (boundaryWarnings.length > 0) {
+        logWarn(logContext, "reconcile", "success", "Accepted downstream boundary leakage under demo policy.", {
+          boundary_policy: input.boundaryPolicy?.downstream ?? "error",
+          warning_count: boundaryWarnings.length,
+          warnings: boundaryWarnings,
         });
-        return {
-          ...combinedRepairedOutput,
-          repair_mode: graphReconciliationModeSchema.parse("repair_fallback"),
-        };
+      }
+      return {
+        ...combinedRepairedOutput,
+        repair_mode: graphReconciliationModeSchema.parse("repair_fallback"),
+        boundary_warnings: boundaryWarnings,
+      };
     } catch (repairError) {
       if (repairError instanceof ApiError) {
+        if (repairError.code === "GRAPH_BOUNDARY_VIOLATION") {
+          throw repairError;
+        }
+
         throw new ApiError(
           "REPAIR_EXHAUSTED",
           "reconcile returned an invalid graph after targeted structural repair.",
           502,
           {
             initial_error: error.message,
+            initial_error_details: error.details ?? null,
             repair_error: repairError.message,
+            repair_error_details: repairError.details ?? null,
             invalid_output: combinedRepairedOutput,
           },
         );

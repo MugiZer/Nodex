@@ -191,3 +191,17 @@ Current rule of use:
 1. prefer the most specific owning `context` file for implementation
 2. use this ledger to understand how earlier contradictions were closed
 3. reopen an item here only if a new edit reintroduces ambiguity or conflicting authority
+
+## Regression Notes
+
+- `DB-TS-01` Timestamp parsing for DB-returned rows must remain centralized on the shared exported DB timestamp schema
+- `DB-TS-01A` The shared DB timestamp schema must continue covering verified live Supabase/PostgREST transport shapes, including naive row strings like `2026-04-03T18:49:09`, before those values enter domain contracts
+- `DB-TS-02` Store duplicate recheck, retrieval candidate loading, and graph readback must keep parse-phase attribution in thrown errors and logs
+- `DB-TS-03` Do not reintroduce file-local `datetime()` clones for Supabase rows; that is the contract mismatch pattern that caused the store regression
+- `DB-SYNC-01` Migrations, handwritten DB types, runtime `select(...)` surfaces, and context docs are not sufficient by themselves; required DB surfaces must be probed or otherwise executable against the live Supabase API surface
+- `DB-SYNC-02` Missing required DB columns/functions must raise `DB_SCHEMA_OUT_OF_SYNC` with the exact failing surface name
+- `DB-SYNC-03` `supabase/database.types.ts` is the runtime DB type source of truth; `lib/supabase.ts` should only alias it, not redefine the DB contract
+- `DB-SYNC-04` `lib/server/db-contract.ts` owns the executable surface probes for graph read, retrieval fallback, and exact duplicate recheck
+- `DB-SYNC-05` Required DB surfaces currently include `graph_read.graph`, `graph_read.nodes`, `graph_read.edges`, `graph_read.progress`, `store.duplicate_recheck.graphs`, and `retrieve.fallback.graphs`
+- `DB-SYNC-06` `lesson_status` remains part of the node API contract, but live graph readback may derive it deterministically instead of requiring a persisted DB column
+- `VIS-DET-01` `visual_verified` must remain a deterministic policy result, not a synonym for "template matched"

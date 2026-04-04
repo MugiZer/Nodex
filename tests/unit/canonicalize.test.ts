@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { ApiError } from "@/lib/errors";
 import {
   canonicalizePrompt,
   parseCanonicalizeModelResult,
@@ -72,6 +73,26 @@ describe("canonicalize prompt grounding flow", () => {
         rejection_reason: "NOT_A_LEARNING_REQUEST",
       }),
     ).toEqual({ error: "NOT_A_LEARNING_REQUEST" });
+
+    expect(() =>
+      parseCanonicalizeModelResult({
+        status: "accepted",
+        subject: "history",
+        topic: "trigonometry",
+        scope_summary:
+          "relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle",
+        core_concepts: [
+          "sine",
+          "cosine",
+          "tangent",
+          "trigonometric identities",
+        ],
+        prerequisites: ["algebra"],
+        downstream_topics: ["calculus", "statistics", "physics"],
+        level: "intermediate",
+        rejection_reason: "",
+      }),
+    ).toThrow(/semantic draft schema/);
   });
 
   it("resolves decisive inventory-covered starter prompts without calling the model", async () => {
@@ -181,5 +202,83 @@ describe("canonicalize prompt grounding flow", () => {
     expect(result.description).toContain("functors");
     expect(result.description).toContain("natural transformations");
     expect(result.description).toContain("algebraic topology");
+  });
+
+  it("uses a demo fallback when draft times out and repair returns an invalid accepted payload", async () => {
+    const callModel = vi.fn(async ({ mode }) => {
+      if (mode === "draft") {
+        throw new ApiError(
+          "UPSTREAM_TIMEOUT",
+          "canonicalize draft timed out after 8000ms.",
+          504,
+        );
+      }
+
+      return {
+        subject: "history",
+        topic: "trigonometry",
+        scope_summary:
+          "relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle",
+        core_concepts: [
+          "sine",
+          "cosine",
+          "tangent",
+          "trigonometric identities",
+        ],
+        prerequisites: ["algebra"],
+        downstream_topics: ["calculus", "statistics", "physics"],
+        level: "intermediate",
+      } as never;
+    });
+
+    const result = await canonicalizePrompt(
+      "I want to learn trigonometry",
+      undefined,
+      { callModel },
+      { mode: "demo" },
+    );
+
+    expect("error" in result).toBe(false);
+    if ("error" in result) {
+      return;
+    }
+
+    expect(result.topic).toBe("trigonometry");
+    expect(result.subject).toBe("general");
+    expect(callModel).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps canonicalize strict when draft times out and repair stays invalid", async () => {
+    const callModel = vi.fn(async ({ mode }) => {
+      if (mode === "draft") {
+        throw new ApiError(
+          "UPSTREAM_TIMEOUT",
+          "canonicalize draft timed out after 8000ms.",
+          504,
+        );
+      }
+
+      return {
+        subject: "history",
+        topic: "trigonometry",
+        scope_summary:
+          "relationships between angles and side lengths in triangles, extending to periodic functions on the unit circle",
+        core_concepts: [
+          "sine",
+          "cosine",
+          "tangent",
+          "trigonometric identities",
+        ],
+        prerequisites: ["algebra"],
+        downstream_topics: ["calculus", "statistics", "physics"],
+        level: "intermediate",
+      } as never;
+    });
+
+    await expect(
+      canonicalizePrompt("I want to learn trigonometry", undefined, { callModel }),
+    ).rejects.toMatchObject({
+      code: "CANONICALIZE_FAILED",
+    });
   });
 });

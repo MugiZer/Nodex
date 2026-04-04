@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   computeAvailableNodeIds,
   getDiagnosticStartNode,
+  getDiagnosticRecommendation,
   getNextDiagnosticNode,
   getRecommendedResumeNodeId,
   isQuizPass,
@@ -32,13 +33,23 @@ describe("progress helpers", () => {
   });
 
   it("selects the middle diagnostic start node and moves by two positions", () => {
-    expect(getDiagnosticStartNode(baseNodesFixture).id).toBe(NODE_2_ID);
+    expect(getDiagnosticStartNode(baseNodesFixture)?.id).toBe(NODE_2_ID);
     expect(
       getNextDiagnosticNode(baseNodesFixture, NODE_2_ID, [NODE_2_ID], true)?.id,
     ).toBe(NODE_3_ID);
     expect(
       getNextDiagnosticNode(baseNodesFixture, NODE_3_ID, [NODE_3_ID], false)?.id,
     ).toBe(NODE_1_ID);
+  });
+
+  it("returns null for empty diagnostic node sets", () => {
+    expect(getDiagnosticStartNode([])).toBeNull();
+    expect(getDiagnosticRecommendation([], [])).toBeNull();
+
+    const run = simulateDiagnosticRun([], []);
+    expect(run.start_node_id).toBeNull();
+    expect(run.recommended_node_id).toBeNull();
+    expect(run.asked_node_ids).toEqual([]);
   });
 
   it("returns the first available incomplete node for resume guidance", () => {

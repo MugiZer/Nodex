@@ -19,8 +19,23 @@
   }
 }
 
+html {
+  min-height: 100%;
+  color-scheme: light;
+}
+
 body {
-  background: var(--background);
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top, rgba(224, 242, 254, 0.35), transparent 38%),
+    linear-gradient(180deg, #fafbfd 0%, #eff4f8 100%);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(14, 165, 233, 0.16);
+  color: #0f172a;
 }

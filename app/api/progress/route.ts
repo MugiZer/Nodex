@@ -19,6 +19,14 @@ export const dynamic = "force-dynamic";
 
 type RouteDependencies = GraphReadDependencies & ProgressWriteDependencies;
 
+function normalizeProgressWriteRequestBody(body: unknown): unknown {
+  if (!Array.isArray(body)) {
+    return body;
+  }
+
+  return body[0] ?? body;
+}
+
 export async function handleProgressWriteRequest(
   request: Request,
   dependencies: RouteDependencies = {},
@@ -28,7 +36,15 @@ export async function handleProgressWriteRequest(
   try {
     logInfo(logContext, "progress_write", "start", "Writing learner progress.");
 
-    const requestBody = await request.json();
+    const rawRequestBody = await request.json();
+    if (Array.isArray(rawRequestBody)) {
+      logInfo(logContext, "progress_write", "start", "Normalizing array-shaped progress write payload.", {
+        body_shape: "array",
+        item_count: rawRequestBody.length,
+      });
+    }
+    const requestBody = normalizeProgressWriteRequestBody(rawRequestBody);
+
     const parsedRequest = progressWriteRequestSchema.parse(requestBody);
     const userId = await requireAuthenticatedUserId(request, dependencies);
     const result = await writeProgressAttempt(parsedRequest, userId, dependencies);

@@ -12,9 +12,10 @@ import type {
 import { ApiError } from "@/lib/errors";
 import { getAnthropicClient, getAnthropicModel } from "@/lib/anthropic";
 import { hashPrompt, type RequestLogContext } from "@/lib/logging";
-import { logError, logInfo } from "@/lib/logging";
+import { logError, logInfo, logWarn } from "@/lib/logging";
 import {
   planGroundedCanonicalization,
+  type CanonicalizeGroundingPlan,
   type RankedCanonicalizeInventoryCandidate,
 } from "@/lib/server/canonicalize-inventory";
 import {
@@ -47,7 +48,7 @@ const canonicalizeDraftSystemPrompt = [
   'If accepted, set "status":"accepted" and set "rejection_reason" to an empty string.',
   'If the prompt is not a learning request, set "status":"rejected", set "rejection_reason":"NOT_A_LEARNING_REQUEST", and set the other fields to empty strings or empty arrays.',
   "Subject must be one of: mathematics, physics, chemistry, biology, computer_science, economics, financial_literacy, statistics, engineering, philosophy, general.",
-  "Topic must name a real academic concept and be appropriate for a 10 to 25 node graph.",
+  "Topic must name a real academic concept and be appropriate for a 4 to 25 node graph.",
   "scope_summary must be one short topic-boundary phrase or sentence fragment, 8 to 24 words, with no trailing punctuation.",
   "core_concepts must list 4 to 8 distinct core subtopics or concepts.",
   "prerequisites must list the prior knowledge needed for the topic.",
@@ -66,6 +67,13 @@ const canonicalizeRepairSystemPrompt = [
   'Always return this flat schema: {"status":"accepted|rejected","subject":"...","topic":"...","scope_summary":"...","core_concepts":["..."],"prerequisites":["..."],"downstream_topics":["..."],"level":"introductory|intermediate|advanced","rejection_reason":"..."}',
   'If accepted, set "status":"accepted" and set "rejection_reason" to an empty string.',
   'If the prompt is not a learning request, set "status":"rejected", set "rejection_reason":"NOT_A_LEARNING_REQUEST", and set the other fields to empty strings or empty arrays.',
+  "Subject must be one of: mathematics, physics, chemistry, biology, computer_science, economics, financial_literacy, statistics, engineering, philosophy, general.",
+  "Topic must name a real academic concept, remain lowercase_with_underscores after normalization, and be appropriate for a 4 to 25 node graph.",
+  "scope_summary must be one short topic-boundary phrase or sentence fragment, 8 to 24 words, with no trailing punctuation.",
+  "core_concepts must list 4 to 8 distinct core subtopics or concepts.",
+  "prerequisites must list 1 to 6 prior-knowledge topics required for the topic.",
+  "downstream_topics must list 3 to 8 important topics this becomes a foundation for.",
+  "level must be exactly introductory, intermediate, or advanced.",
   "Preserve the original topic intent while fixing formatting, normalization, missing list structure, duplicates, or underspecified semantic fields.",
   "If approved candidate topics are provided, keep the repaired topic within that approved set.",
   "Do not invent new semantic content that is absent from the prompt unless it is required to restate the same already-implied topic boundary.",
@@ -84,6 +92,8 @@ type CanonicalizeModelCallInput = {
 export type CanonicalizeDependencies = {
   callModel?: (input: CanonicalizeModelCallInput) => Promise<CanonicalizeModelResult>;
 };
+
+export type CanonicalizeExecutionMode = "strict" | "demo";
 
 function buildGroundedCandidatesBlock(candidates?: CanonicalizeInventoryEntry[]): string[] {
   if (!candidates || candidates.length === 0) {
@@ -158,7 +168,14 @@ export function parseCanonicalizeModelResult(value: unknown): CanonicalizeModelR
       "CANONICALIZE_INVALID_MODEL_OUTPUT",
       "Claude returned an accepted canonicalize payload that did not match the semantic draft schema.",
       502,
-      successDraft.error.flatten(),
+      {
+        ...successDraft.error.flatten(),
+        raw_candidate: truncateForLog({
+          subject: parsed.data.subject,
+          topic: parsed.data.topic,
+          level: parsed.data.level,
+        }),
+      },
     );
   }
 
@@ -280,6 +297,128 @@ function createResolutionMetadata(input: {
   };
 }
 
+function extractCanonicalizeFailureSubtype(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.code === "UPSTREAM_TIMEOUT") {
+      return "draft_timeout";
+    }
+    if (error.code === "CANONICALIZE_INVALID_MODEL_OUTPUT") {
+      return "repair_semantic_invalid";
+    }
+    if (error.code === "CANONICALIZE_CONSTRAINED_TOPIC_MISMATCH") {
+      return "repair_topic_mismatch";
+    }
+  }
+
+  if (error instanceof Error) {
+    return "unexpected_internal";
+  }
+
+  return "unknown_failure";
+}
+
+function extractInvalidFieldSummary(error: unknown): Record<string, unknown> | null {
+  if (!(error instanceof ApiError)) {
+    return null;
+  }
+
+  const details = error.details;
+  if (!details || typeof details !== "object") {
+    return null;
+  }
+
+  const candidate = details as {
+    fieldErrors?: unknown;
+    raw_candidate?: unknown;
+  };
+
+  return truncateForLog({
+    fieldErrors: candidate.fieldErrors ?? null,
+    raw_candidate: candidate.raw_candidate ?? null,
+  }) as Record<string, unknown>;
+}
+
+function extractLearningTopicPhrase(prompt: string): string | null {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  const patterns = [
+    /(?:i want to|i'd like to|please help me)\s+(?:learn|study|understand|master|explore)\s+(.+)$/i,
+    /(?:learn|study|understand|master|explore)\s+(.+)$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    const phrase = match?.[1]
+      ?.replace(/[.?!]+$/g, "")
+      .replace(/^(about|the)\s+/i, "")
+      .trim();
+    if (phrase) {
+      return phrase;
+    }
+  }
+
+  return null;
+}
+
+function createHeuristicFallbackDraft(prompt: string): CanonicalizeModelSuccessDraft | null {
+  const phrase = extractLearningTopicPhrase(prompt);
+  if (!phrase) {
+    return null;
+  }
+
+  const topic = phrase
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
+
+  if (!/^[a-z][a-z0-9_]*$/.test(topic)) {
+    return null;
+  }
+
+  return {
+    subject: "general",
+    topic,
+    scope_summary: `core ideas, vocabulary, methods, and practical applications involved in ${phrase}`,
+    core_concepts: [
+      `foundational ideas of ${phrase}`,
+      `key terminology in ${phrase}`,
+      `core methods in ${phrase}`,
+      `common representations of ${phrase}`,
+      `typical problem types in ${phrase}`,
+      `practical applications of ${phrase}`,
+    ],
+    prerequisites: ["basic reading comprehension"],
+    downstream_topics: [
+      `advanced ${phrase}`,
+      "applied problem solving",
+      "interdisciplinary study",
+    ],
+    level: "introductory",
+  };
+}
+
+function buildDemoFallbackDraft(
+  prompt: string,
+  groundingPlan: CanonicalizeGroundingPlan,
+): { draft: CanonicalizeModelSuccessDraft; mode: "grounded_candidate" | "heuristic_general" } | null {
+  if (groundingPlan.grounded_candidates.length > 0) {
+    return {
+      draft: groundingPlan.grounded_candidates[0]!,
+      mode: "grounded_candidate",
+    };
+  }
+
+  const heuristicDraft = createHeuristicFallbackDraft(prompt);
+  if (heuristicDraft) {
+    return {
+      draft: heuristicDraft,
+      mode: "heuristic_general",
+    };
+  }
+
+  return null;
+}
+
 function assertGroundedTopicChoice(
   draft: CanonicalizeModelSuccessDraft,
   groundedCandidates: CanonicalizeInventoryEntry[],
@@ -316,15 +455,41 @@ function resolveDraftOrThrow(
   context: RequestLogContext,
   metadata: CanonicalizeResolutionMetadata,
 ): CanonicalizeResolvedSuccess {
+  const draftInput = {
+    subject: draft.subject,
+    topic: draft.topic,
+    scope_summary: draft.scope_summary,
+    core_concepts: draft.core_concepts,
+    prerequisites: draft.prerequisites,
+    downstream_topics: draft.downstream_topics,
+    level: draft.level,
+  };
+  const validatedDraft = canonicalizeModelSuccessDraftSchema.safeParse(draftInput);
+  if (!validatedDraft.success) {
+    throw new ApiError(
+      "CANONICALIZE_INVALID_MODEL_OUTPUT",
+      "Claude returned an accepted canonicalize payload that did not match the semantic draft schema.",
+      502,
+      {
+        ...validatedDraft.error.flatten(),
+        raw_candidate: truncateForLog({
+          subject: draftInput.subject,
+          topic: draftInput.topic,
+          level: draftInput.level,
+        }),
+      },
+    );
+  }
+
   logInfo(context, "canonicalize", "success", "Canonicalize draft parsed.", {
-    prompt_hash: hashPrompt(JSON.stringify(draft)),
-    raw_draft: truncateForLog(draft),
+    prompt_hash: hashPrompt(JSON.stringify(validatedDraft.data)),
+    raw_draft: truncateForLog(validatedDraft.data),
     canonicalization_source: metadata.canonicalization_source,
     candidate_confidence_band: metadata.candidate_confidence_band,
     inventory_candidate_topics: metadata.inventory_candidate_topics,
   });
 
-  const resolved = resolveCanonicalizeDraft(draft, metadata);
+  const resolved = resolveCanonicalizeDraft(validatedDraft.data, metadata);
 
   logInfo(context, "canonicalize", "success", "Canonicalize draft resolved.", {
     normalized_draft: {
@@ -350,10 +515,12 @@ export async function canonicalizePrompt(
   prompt: string,
   context?: RequestLogContext,
   dependencies: CanonicalizeDependencies = {},
+  options: { mode?: CanonicalizeExecutionMode } = {},
 ): Promise<CanonicalizeResolvedResult> {
   const validatedPrompt = canonicalizePromptSchema.parse(prompt);
   const logContext = context ?? createFallbackContext();
   const modelCaller = dependencies.callModel ?? callCanonicalizeModel;
+  const executionMode = options.mode ?? "strict";
 
   logInfo(logContext, "canonicalize", "start", "Starting canonicalize.", {
     prompt_hash: hashPrompt(validatedPrompt),
@@ -447,9 +614,11 @@ export async function canonicalizePrompt(
       "Canonicalize draft failed validation; attempting targeted repair.",
       error,
       {
+        failure_subtype: extractCanonicalizeFailureSubtype(error),
         repair_mode: "targeted",
         invalid_draft: truncateForLog(firstDraft),
         validation_errors: truncateForLog(extractValidationErrors(firstError)),
+        invalid_field_summary: extractInvalidFieldSummary(error),
       },
     );
   }
@@ -504,10 +673,49 @@ export async function canonicalizePrompt(
       "Canonicalize failed after targeted repair.",
       error,
       {
+        failure_subtype: extractCanonicalizeFailureSubtype(error),
         validation_errors: truncateForLog(extractValidationErrors(firstError)),
         invalid_draft: truncateForLog(firstDraft),
+        invalid_field_summary: extractInvalidFieldSummary(error),
       },
     );
+
+    if (
+      executionMode === "demo" &&
+      extractCanonicalizeFailureSubtype(firstError) === "draft_timeout"
+    ) {
+      const fallback = buildDemoFallbackDraft(validatedPrompt, groundingPlan);
+      if (fallback) {
+        const fallbackMetadata = createResolutionMetadata({
+          source:
+            fallback.mode === "grounded_candidate" ? "grounded_match" : "model_only",
+          inventoryCandidateTopics:
+            fallback.mode === "grounded_candidate"
+              ? groundingPlan.inventory_candidate_topics
+              : [],
+          candidateConfidenceBand:
+            fallback.mode === "grounded_candidate"
+              ? groundingPlan.candidate_confidence_band
+              : "none",
+        });
+        const resolved = resolveDraftOrThrow(fallback.draft, logContext, fallbackMetadata);
+        logWarn(
+          logContext,
+          "canonicalize",
+          "success",
+          "Canonicalize used demo fallback after draft timeout and repair failure.",
+          {
+            fallback_mode: fallback.mode,
+            initial_failure_subtype: extractCanonicalizeFailureSubtype(firstError),
+            repair_failure_subtype: extractCanonicalizeFailureSubtype(error),
+            canonicalization_source: resolved.canonicalization_source,
+            topic: resolved.topic,
+            subject: resolved.subject,
+          },
+        );
+        return resolved;
+      }
+    }
 
     throw new ApiError(
       "CANONICALIZE_FAILED",

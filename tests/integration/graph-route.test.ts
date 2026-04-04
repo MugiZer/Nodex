@@ -50,6 +50,74 @@ function buildIndependentFanInDraft() {
   };
 }
 
+function buildLimitLawsBoundaryDraft() {
+  return {
+    nodes: [
+      { id: "node_1", title: "Real Number Arithmetic", position: 0 },
+      { id: "node_2", title: "Basic Algebra", position: 0 },
+      { id: "node_3", title: "Function Notation", position: 0 },
+      { id: "node_4", title: "Intuitive Concept of a Limit", position: 0 },
+      { id: "node_5", title: "One-Sided Limits", position: 1 },
+      { id: "node_6", title: "Limit of a Constant Function", position: 1 },
+      { id: "node_7", title: "Limit of the Identity Function", position: 1 },
+      { id: "node_8", title: "Sum and Difference Rule for Limits", position: 2 },
+      { id: "node_9", title: "Constant Multiple Rule for Limits", position: 3 },
+      { id: "node_10", title: "Product Rule for Limits", position: 3 },
+      { id: "node_11", title: "Quotient Rule for Limits", position: 4 },
+      { id: "node_12", title: "Power Rule for Limits", position: 4 },
+      { id: "node_13", title: "Root Rule for Limits", position: 5 },
+      { id: "node_14", title: "Squeeze Theorem", position: 3 },
+      { id: "node_15", title: "Limits of Composite Functions", position: 6 },
+    ],
+    edges: [
+      { from_node_id: "node_1", to_node_id: "node_6", type: "hard" as const },
+      { from_node_id: "node_1", to_node_id: "node_7", type: "hard" as const },
+      { from_node_id: "node_2", to_node_id: "node_8", type: "hard" as const },
+      { from_node_id: "node_3", to_node_id: "node_5", type: "hard" as const },
+      { from_node_id: "node_3", to_node_id: "node_15", type: "soft" as const },
+      { from_node_id: "node_4", to_node_id: "node_5", type: "hard" as const },
+      { from_node_id: "node_4", to_node_id: "node_6", type: "hard" as const },
+      { from_node_id: "node_4", to_node_id: "node_7", type: "hard" as const },
+      { from_node_id: "node_5", to_node_id: "node_8", type: "soft" as const },
+      { from_node_id: "node_6", to_node_id: "node_8", type: "hard" as const },
+      { from_node_id: "node_7", to_node_id: "node_8", type: "hard" as const },
+      { from_node_id: "node_8", to_node_id: "node_9", type: "hard" as const },
+      { from_node_id: "node_8", to_node_id: "node_10", type: "hard" as const },
+      { from_node_id: "node_9", to_node_id: "node_11", type: "hard" as const },
+      { from_node_id: "node_10", to_node_id: "node_11", type: "hard" as const },
+      { from_node_id: "node_10", to_node_id: "node_12", type: "hard" as const },
+      { from_node_id: "node_11", to_node_id: "node_13", type: "hard" as const },
+      { from_node_id: "node_12", to_node_id: "node_13", type: "hard" as const },
+      { from_node_id: "node_8", to_node_id: "node_14", type: "hard" as const },
+      { from_node_id: "node_10", to_node_id: "node_14", type: "soft" as const },
+      { from_node_id: "node_13", to_node_id: "node_15", type: "hard" as const },
+      { from_node_id: "node_14", to_node_id: "node_15", type: "soft" as const },
+    ],
+  };
+}
+
+function buildCyclicDraft() {
+  return {
+    nodes: Array.from({ length: 10 }, (_, index) => ({
+      id: `node_${index + 1}`,
+      title: `Concept ${index + 1}`,
+      position: index,
+    })),
+    edges: [
+      { from_node_id: "node_1", to_node_id: "node_2", type: "hard" as const },
+      { from_node_id: "node_2", to_node_id: "node_3", type: "hard" as const },
+      { from_node_id: "node_3", to_node_id: "node_1", type: "hard" as const },
+      { from_node_id: "node_3", to_node_id: "node_4", type: "hard" as const },
+      { from_node_id: "node_4", to_node_id: "node_5", type: "hard" as const },
+      { from_node_id: "node_5", to_node_id: "node_6", type: "hard" as const },
+      { from_node_id: "node_6", to_node_id: "node_7", type: "hard" as const },
+      { from_node_id: "node_7", to_node_id: "node_8", type: "hard" as const },
+      { from_node_id: "node_8", to_node_id: "node_9", type: "hard" as const },
+      { from_node_id: "node_9", to_node_id: "node_10", type: "hard" as const },
+    ],
+  };
+}
+
 describe("graph route", () => {
   it("returns mixed ready and pending lesson_status values in graph payloads", async () => {
     const mixedPayload = {
@@ -90,6 +158,27 @@ describe("graph route", () => {
           diagnostic_questions: null,
         }),
       ]),
+    });
+  });
+
+  it("rejects empty graph payloads as incomplete rather than returning a broken diagnostic target", async () => {
+    const response = await handleGraphReadRequest(
+      new Request(`http://localhost/api/graph/${TEST_GRAPH_ID}`),
+      { params: Promise.resolve({ id: TEST_GRAPH_ID }) },
+      {
+        resolveAuthenticatedUserId: async () => TEST_USER_ID,
+        fetchGraphPayload: async () => ({
+          ...baseGraphPayloadFixture,
+          nodes: [],
+          edges: [],
+          progress: [],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "GRAPH_INCOMPLETE",
     });
   });
 
@@ -172,6 +261,28 @@ describe("graph route", () => {
         curriculumValidatorDependencies: {
           callModel: async () => ({ valid: true, issues: [] }),
         },
+        reconcilerDependencies: {
+          callModel: async () => ({
+            nodes: DAY2_GRAPH_DRAFT.nodes.map((node, index) =>
+              index === 0
+                ? {
+                    ...node,
+                    title: "Arithmetic Basics",
+                  }
+                : node,
+            ),
+            edges: DAY2_GRAPH_DRAFT.edges,
+            resolution_summary: [
+              {
+                issue_key: "structure:boundary_violation:node_1",
+                issue_source: "structure_validator" as const,
+                issue_description:
+                  'The graph includes assumed prior knowledge "arithmetic" as node content via token boundary matching.',
+                resolution_action: "Kept the node unchanged.",
+              },
+            ],
+          }),
+        },
       },
     );
 
@@ -213,6 +324,28 @@ describe("graph route", () => {
         },
         curriculumValidatorDependencies: {
           callModel: async () => ({ valid: true, issues: [] }),
+        },
+        reconcilerDependencies: {
+          callModel: async () => ({
+            nodes: DAY2_GRAPH_DRAFT.nodes.map((node, index) =>
+              index === 0
+                ? {
+                    ...node,
+                    title: "Arithmetic Basics",
+                  }
+                : node,
+            ),
+            edges: DAY2_GRAPH_DRAFT.edges,
+            resolution_summary: [
+              {
+                issue_key: "structure:boundary_violation:node_1",
+                issue_source: "structure_validator" as const,
+                issue_description:
+                  'The graph includes assumed prior knowledge "arithmetic" as node content via token boundary matching.',
+                resolution_action: "Kept the node unchanged.",
+              },
+            ],
+          }),
         },
       },
     );
@@ -287,6 +420,28 @@ describe("graph route", () => {
         },
         curriculumValidatorDependencies: {
           callModel: async () => ({ valid: true, issues: [] }),
+        },
+        reconcilerDependencies: {
+          callModel: async () => ({
+            nodes: DAY2_GRAPH_DRAFT.nodes.map((node, index) =>
+              index === 0
+                ? {
+                    ...node,
+                    title: "Arithmetic Basics",
+                  }
+                : node,
+            ),
+            edges: DAY2_GRAPH_DRAFT.edges,
+            resolution_summary: [
+              {
+                issue_key: "structure:boundary_violation:node_1",
+                issue_source: "structure_validator" as const,
+                issue_description:
+                  'The graph includes assumed prior knowledge "arithmetic" as node content via token boundary matching.',
+                resolution_action: "Kept the node unchanged.",
+              },
+            ],
+          }),
         },
       },
     );
@@ -542,12 +697,59 @@ describe("graph route", () => {
         curriculumValidatorDependencies: {
           callModel: async () => ({ valid: true, issues: [] }),
         },
+        reconcilerDependencies: {
+          callModel: async () => ({
+            nodes: DAY2_GRAPH_DRAFT.nodes.map((node, index) =>
+              index === 0
+                ? {
+                    ...node,
+                    title: "Arithmetic Basics",
+                  }
+                : node,
+            ),
+            edges: DAY2_GRAPH_DRAFT.edges,
+            resolution_summary: [
+              {
+                issue_key: "structure:boundary_violation:node_1",
+                issue_source: "structure_validator" as const,
+                issue_description:
+                  'The graph includes assumed prior knowledge "arithmetic" as node content via token boundary matching.',
+                resolution_action: "Kept the node unchanged.",
+              },
+            ],
+          }),
+        },
       },
     );
 
     expect(response.status).toBe(422);
     await expect(response.json()).resolves.toMatchObject({
       error: "GRAPH_BOUNDARY_VIOLATION",
+    });
+  });
+
+  it("keeps cyclic generator drafts fatal in the strict graph route", async () => {
+    const response = await handleGraphGenerateRequest(
+      new Request("http://localhost/api/generate/graph", {
+        method: "POST",
+        body: JSON.stringify({
+          subject: "mathematics",
+          topic: "graph_theory",
+          description: "Graph theory studies nodes, edges, and traversals.",
+        }),
+      }),
+      {
+        graphGeneratorDependencies: {
+          callModel: async () => buildCyclicDraft(),
+        },
+      },
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "LLM_OUTPUT_INVALID",
+      message:
+        "graph_generate failed semantic validation: graph returned a cyclic hard-edge dependency chain.",
     });
   });
 
@@ -654,6 +856,65 @@ describe("graph route", () => {
           structure_issue_type_counts: {
             edge_misclassification: 1,
           },
+        },
+      },
+    });
+  });
+
+  it("deterministically prunes boundary nodes and repairs fan-in before reconcile for limit laws", async () => {
+    const draft = buildLimitLawsBoundaryDraft();
+
+    const response = await handleGraphGenerateRequest(
+      new Request("http://localhost/api/generate/graph?debug=1", {
+        method: "POST",
+        body: JSON.stringify({
+          subject: "mathematics",
+          topic: "limit_laws",
+          description:
+            "Limit Laws is the study of rules and properties governing the evaluation of limits of functions. It encompasses sum and difference rules, product rule, quotient rule, constant multiple rule, power and root rules, squeeze theorem, and limits of composite functions. It assumes prior knowledge of function notation, basic algebra, intuitive concept of a limit, and real number arithmetic and serves as a foundation for continuity, derivative definition, differentiation rules, l_hopitals_rule, infinite_series, and multivariable_limits. Within mathematics, it is typically encountered at the introductory level.",
+          prerequisites: [
+            "function notation",
+            "basic algebra",
+            "intuitive concept of a limit",
+            "real number arithmetic",
+          ],
+          downstream_topics: [
+            "continuity",
+            "derivative_definition",
+            "differentiation_rules",
+            "l_hopitals_rule",
+            "infinite_series",
+            "multivariable_limits",
+          ],
+        }),
+      }),
+      {
+        graphGeneratorDependencies: {
+          callModel: async () => draft,
+        },
+        reconcilerDependencies: {
+          callModel: async () => {
+            throw new Error("reconciler LLM should not be called for deterministic repair");
+          },
+        },
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      nodes: expect.arrayContaining([
+        expect.objectContaining({ id: "node_5", title: "One-Sided Limits" }),
+        expect.objectContaining({ id: "node_8", title: "Sum and Difference Rule for Limits" }),
+      ]),
+      debug: {
+        telemetry: {
+          repair_mode: "deterministic_only_repaired",
+          structure_issue_type_counts: {
+            boundary_violation: 4,
+          },
+        },
+        reconciliation: {
+          repair_mode: "deterministic_only_repaired",
         },
       },
     });

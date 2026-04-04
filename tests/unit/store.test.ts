@@ -97,6 +97,63 @@ function buildTestGraphEdges() {
   }));
 }
 
+function createExactDuplicateQueryClient(rows: Array<Record<string, unknown>>) {
+  const rpc = vi.fn();
+
+  return {
+    rpc,
+    client: {
+      from: vi.fn((table: string) => {
+        if (table !== "graphs") {
+          throw new Error(`Unexpected table access: ${table}`);
+        }
+
+        let selectClause = "";
+        const resolveResult = () => {
+          if (selectClause === "version") {
+            return {
+              data: [{ version: 1 }],
+              error: null,
+            };
+          }
+
+          return {
+            data: rows,
+            error: null,
+          };
+        };
+
+        return {
+          select(value: string) {
+            selectClause = value;
+            return this;
+          },
+          eq() {
+            return this;
+          },
+          order() {
+            return this;
+          },
+          limit() {
+            return Promise.resolve(resolveResult());
+          },
+          then<TResult1 = Awaited<ReturnType<typeof resolveResult>>, TResult2 = never>(
+            onfulfilled?:
+              | ((value: Awaited<ReturnType<typeof resolveResult>>) => TResult1 | PromiseLike<TResult1>)
+              | null,
+            onrejected?:
+              | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+              | null,
+          ) {
+            return Promise.resolve(resolveResult()).then(onfulfilled, onrejected);
+          },
+        };
+      }),
+      rpc,
+    },
+  };
+}
+
 describe("store helpers", () => {
   it("remaps temp ids into persisted UUIDs and rewrites embedded node refs", async () => {
     const rpc = vi.fn().mockResolvedValue({
@@ -142,6 +199,7 @@ describe("store helpers", () => {
       undefined,
       {
         precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+        findExactDuplicateCandidates: async () => [],
         searchRetrievalCandidates: async () => [],
         createUuid,
         createServiceClient: () => serviceClient as never,
@@ -205,6 +263,7 @@ describe("store helpers", () => {
       undefined,
       {
         precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+        findExactDuplicateCandidates: async () => [],
         searchRetrievalCandidates: async () => [
           {
             id: graphId,
@@ -222,6 +281,638 @@ describe("store helpers", () => {
       graph_id: graphId,
     });
     expect(rpc).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs duplicate-safeguard decisions with candidate context", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const rpc = vi.fn();
+    const duplicateCandidate = {
+      id: graphId,
+      similarity: 0.93,
+      flagged_for_review: false,
+      version: 2,
+      created_at: "2026-04-01T00:00:00.000Z",
+    };
+
+    try {
+      const result = await storeGeneratedGraph(
+        {
+          graph: baseGraph,
+          nodes: buildTestGraphNodes(),
+          edges: buildTestGraphEdges(),
+        },
+        undefined,
+        {
+          precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+          findExactDuplicateCandidates: async () => [],
+          searchRetrievalCandidates: async () => [duplicateCandidate],
+          createServiceClient: () =>
+            ({
+              from: vi.fn(),
+              rpc,
+            }) as never,
+        },
+      );
+
+      expect(result).toMatchObject({
+        graph_id: graphId,
+        duplicate_of_graph_id: graphId,
+      });
+      expect(rpc).not.toHaveBeenCalled();
+
+      const duplicateLog = logSpy.mock.calls
+        .map(([entry]) => JSON.parse(String(entry)) as Record<string, unknown>)
+        .find((entry) => entry.message === "Store duplicate safeguard returned existing graph.");
+
+      expect(duplicateLog).toMatchObject({
+        duplicate_reason: "usable_unflagged_match",
+        duplicate_candidate_id: graphId,
+        duplicate_candidate_similarity: 0.93,
+        duplicate_candidate_flagged_for_review: false,
+        duplicate_lookup_mode: "semantic",
+        graph_identity_fingerprint: expect.any(String),
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("short-circuits exact duplicates before semantic duplicate search", async () => {
+    const rpc = vi.fn();
+    const searchRetrievalCandidates = vi.fn(async () => {
+      throw new Error("semantic duplicate search should not run when exact match exists");
+    });
+    const exactCandidate = {
+      id: graphId,
+      similarity: 1,
+      flagged_for_review: false,
+      version: 2,
+      created_at: "2026-04-01T00:00:00.000Z",
+    };
+
+    const result = await storeGeneratedGraph(
+      {
+        graph: baseGraph,
+        nodes: buildTestGraphNodes(),
+        edges: buildTestGraphEdges(),
+      },
+      undefined,
+      {
+        precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+        findExactDuplicateCandidates: async () => [exactCandidate],
+        searchRetrievalCandidates,
+        createServiceClient: () =>
+          ({
+            from: vi.fn(),
+            rpc,
+          }) as never,
+      },
+    );
+
+    expect(result).toMatchObject({
+      graph_id: graphId,
+      duplicate_of_graph_id: graphId,
+    });
+    expect(searchRetrievalCandidates).not.toHaveBeenCalled();
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it("short-circuits exact duplicates when the DB row returns a naive created_at timestamp", async () => {
+    const searchRetrievalCandidates = vi.fn(async () => {
+      throw new Error("semantic duplicate search should not run when exact match exists");
+    });
+    const serviceClient = createExactDuplicateQueryClient([
+      {
+        id: graphId,
+        flagged_for_review: false,
+        version: 2,
+        created_at: "2026-04-03T18:49:09",
+      },
+    ]);
+
+    const result = await storeGeneratedGraph(
+      {
+        graph: baseGraph,
+        nodes: buildTestGraphNodes(),
+        edges: buildTestGraphEdges(),
+      },
+      undefined,
+      {
+        precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+        searchRetrievalCandidates,
+        createServiceClient: () => serviceClient.client as never,
+      },
+    );
+
+    expect(result).toMatchObject({
+      graph_id: graphId,
+      duplicate_of_graph_id: graphId,
+    });
+    expect(searchRetrievalCandidates).not.toHaveBeenCalled();
+  });
+
+  it("surfaces duplicate-candidate parse boundaries when exact duplicate rows are invalid", async () => {
+    const serviceClient = createExactDuplicateQueryClient([
+      {
+        id: graphId,
+        flagged_for_review: false,
+        version: 2,
+        created_at: "not-a-timestamp",
+      },
+    ]);
+
+    await expect(
+      storeGeneratedGraph(
+        {
+          graph: baseGraph,
+          nodes: buildTestGraphNodes(),
+          edges: buildTestGraphEdges(),
+        },
+        undefined,
+        {
+          precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+          createServiceClient: () => serviceClient.client as never,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "STORE_UNEXPECTED_INTERNAL",
+      details: expect.objectContaining({
+        schema: "retrievalCandidateSchema",
+        phase: "store.duplicate_recheck.read_parse",
+      }),
+    });
+  });
+
+  it("raises DB_SCHEMA_OUT_OF_SYNC when the exact-duplicate graph surface is missing a required column", async () => {
+    const serviceClient = {
+      from: vi.fn(() => ({
+        select() {
+          return this;
+        },
+        eq() {
+          return this;
+        },
+        order() {
+          return this;
+        },
+        limit() {
+          return Promise.resolve({
+            data: null,
+            error: { message: "column graphs.created_at does not exist" },
+          });
+        },
+        then<TResult1 = unknown, TResult2 = never>(
+          onfulfilled?:
+            | ((value: { data: null; error: { message: string } }) => TResult1 | PromiseLike<TResult1>)
+            | null,
+          onrejected?:
+            | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+            | null,
+        ) {
+          return Promise.resolve({
+            data: null,
+            error: { message: "column graphs.created_at does not exist" },
+          }).then(onfulfilled, onrejected);
+        },
+      })),
+      rpc: vi.fn(),
+    };
+
+    await expect(
+      storeGeneratedGraph(
+        {
+          graph: baseGraph,
+          nodes: buildTestGraphNodes(),
+          edges: buildTestGraphEdges(),
+        },
+        undefined,
+        {
+          precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+          createServiceClient: () => serviceClient as never,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "DB_SCHEMA_OUT_OF_SYNC",
+      details: expect.objectContaining({
+        surface: "store.duplicate_recheck.graphs",
+        source_table: "graphs",
+      }),
+    });
+  });
+
+  it("falls back to direct table writes when the store RPC is unavailable", async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      data: null,
+      error: {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.store_generated_graph(p_edges, p_embedding, p_graph, p_nodes) in the schema cache",
+      },
+    });
+    const inserted = {
+      graphs: [] as Array<Record<string, unknown>>,
+      nodes: [] as Array<Record<string, unknown>>,
+      edges: [] as Array<Record<string, unknown>>,
+    };
+    const graphsQuery = vi.fn().mockResolvedValue({
+      data: [{ version: 1 }],
+      error: null,
+    });
+    const serviceClient = {
+      from: vi.fn((table: string) => {
+        if (table === "graphs") {
+          return {
+            select() {
+              return this;
+            },
+            eq() {
+              return this;
+            },
+            order() {
+              return this;
+            },
+            limit() {
+              return graphsQuery();
+            },
+            insert(value: Record<string, unknown>) {
+              inserted.graphs.push(value);
+              return Promise.resolve({ data: null, error: null });
+            },
+          };
+        }
+
+        if (table === "nodes") {
+          return {
+            select(fields?: string, options?: { head?: boolean; count?: string }) {
+              if (options?.head) {
+                return Promise.resolve({ data: [], error: null });
+              }
+              return this;
+            },
+            limit() {
+              return Promise.resolve({ data: [], error: null });
+            },
+            insert(value: Array<Record<string, unknown>> | Record<string, unknown>) {
+              inserted.nodes.push(...(Array.isArray(value) ? value : [value]));
+              return Promise.resolve({ data: null, error: null });
+            },
+          };
+        }
+
+        if (table === "edges") {
+          return {
+            select(fields?: string, options?: { head?: boolean; count?: string }) {
+              if (options?.head) {
+                return Promise.resolve({ data: [], error: null });
+              }
+              return this;
+            },
+            limit() {
+              return Promise.resolve({ data: [], error: null });
+            },
+            insert(value: Array<Record<string, unknown>> | Record<string, unknown>) {
+              inserted.edges.push(...(Array.isArray(value) ? value : [value]));
+              return Promise.resolve({ data: null, error: null });
+            },
+          };
+        }
+
+        throw new Error(`Unexpected table access: ${table}`);
+      }),
+      rpc,
+    };
+
+    const result = await storeGeneratedGraph(
+      {
+        graph: baseGraph,
+        nodes: buildTestGraphNodes(),
+        edges: buildTestGraphEdges(),
+      },
+      undefined,
+      {
+        precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+        findExactDuplicateCandidates: async () => [],
+        searchRetrievalCandidates: async () => [],
+        createUuid: vi
+          .fn()
+          .mockImplementation(() => randomUUID())
+          .mockReturnValueOnce(graphId),
+        createServiceClient: () => serviceClient as never,
+      },
+    );
+
+    expect(result.graph_id).toBe(graphId);
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(inserted.graphs).toHaveLength(1);
+    expect(inserted.nodes).toHaveLength(10);
+    expect(inserted.edges).toHaveLength(9);
+    expect(inserted.graphs[0]).toMatchObject({
+      id: graphId,
+      title: baseGraph.title,
+      subject: baseGraph.subject,
+      topic: baseGraph.topic,
+    });
+  });
+
+  it("rolls back partial fallback writes when a downstream insert fails", async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      data: null,
+      error: {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.store_generated_graph(p_edges, p_embedding, p_graph, p_nodes) in the schema cache",
+      },
+    });
+    const inserted = {
+      graphs: [] as Array<Record<string, unknown>>,
+      nodes: [] as Array<Record<string, unknown>>,
+      edges: [] as Array<Record<string, unknown>>,
+    };
+    const deleted = {
+      graphs: 0,
+      nodes: 0,
+      edges: 0,
+    };
+    const serviceClient = {
+      from: vi.fn((table: string) => {
+        if (table === "graphs") {
+          return {
+            select() {
+              return this;
+            },
+            eq() {
+              return this;
+            },
+            order() {
+              return this;
+            },
+            limit() {
+              return Promise.resolve({
+                data: [{ version: 1 }],
+                error: null,
+              });
+            },
+            insert(value: Record<string, unknown>) {
+              inserted.graphs.push(value);
+              return Promise.resolve({ data: null, error: null });
+            },
+            delete() {
+              return {
+                eq() {
+                  deleted.graphs += 1;
+                  return Promise.resolve({ data: null, error: null });
+                },
+              };
+            },
+          };
+        }
+
+        if (table === "nodes") {
+          return {
+            select(fields?: string, options?: { head?: boolean; count?: string }) {
+              if (options?.head) {
+                return Promise.resolve({ data: [], error: null });
+              }
+              return this;
+            },
+            limit() {
+              return Promise.resolve({ data: [], error: null });
+            },
+            insert(value: Array<Record<string, unknown>> | Record<string, unknown>) {
+              inserted.nodes.push(...(Array.isArray(value) ? value : [value]));
+              return Promise.resolve({
+                data: null,
+                error: {
+                  message:
+                    "Could not find the 'lesson_status' column of 'nodes' in the schema cache",
+                },
+              });
+            },
+            delete() {
+              return {
+                eq() {
+                  deleted.nodes += 1;
+                  return Promise.resolve({ data: null, error: null });
+                },
+              };
+            },
+          };
+        }
+
+        if (table === "edges") {
+          return {
+            select(fields?: string, options?: { head?: boolean; count?: string }) {
+              if (options?.head) {
+                return Promise.resolve({ data: [], error: null });
+              }
+              return this;
+            },
+            limit() {
+              return Promise.resolve({ data: [], error: null });
+            },
+            insert(value: Array<Record<string, unknown>> | Record<string, unknown>) {
+              inserted.edges.push(...(Array.isArray(value) ? value : [value]));
+              return Promise.resolve({ data: null, error: null });
+            },
+            delete() {
+              let deletedOnce = false;
+              return {
+                in() {
+                  return this;
+                },
+                eq() {
+                  return Promise.resolve({ data: null, error: null });
+                },
+                then<TResult1 = unknown, TResult2 = never>(
+                  onfulfilled?:
+                    | ((value: { data: null; error: null }) => TResult1 | PromiseLike<TResult1>)
+                    | null,
+                  onrejected?:
+                    | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+                    | null,
+                ) {
+                  if (!deletedOnce) {
+                    deleted.edges += 1;
+                    deletedOnce = true;
+                  }
+                  return Promise.resolve({ data: null, error: null }).then(onfulfilled, onrejected);
+                },
+              };
+            },
+          };
+        }
+
+        throw new Error(`Unexpected table access: ${table}`);
+      }),
+      rpc,
+    };
+
+    await expect(
+      storeGeneratedGraph(
+        {
+          graph: baseGraph,
+          nodes: buildTestGraphNodes(),
+          edges: buildTestGraphEdges(),
+        },
+        undefined,
+        {
+          precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+          findExactDuplicateCandidates: async () => [],
+          searchRetrievalCandidates: async () => [],
+          createUuid: vi
+            .fn()
+            .mockImplementation(() => randomUUID())
+            .mockReturnValueOnce(graphId),
+          createServiceClient: () => serviceClient as never,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "DB_SCHEMA_OUT_OF_SYNC",
+    });
+
+    expect(inserted.graphs).toHaveLength(1);
+    expect(inserted.nodes).toHaveLength(10);
+    expect(deleted.graphs).toBe(1);
+    expect(deleted.nodes).toBe(1);
+    expect(deleted.edges).toBe(1);
+  });
+
+  it("omits lesson_status in fallback node inserts when the live nodes surface does not expose it", async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      data: null,
+      error: {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.store_generated_graph(p_edges, p_embedding, p_graph, p_nodes) in the schema cache",
+      },
+    });
+    const inserted = {
+      graphs: [] as Array<Record<string, unknown>>,
+      nodes: [] as Array<Record<string, unknown>>,
+      edges: [] as Array<Record<string, unknown>>,
+    };
+    const graphsQuery = vi.fn().mockResolvedValue({
+      data: [{ version: 1 }],
+      error: null,
+    });
+    const serviceClient = {
+      from: vi.fn((table: string) => {
+        if (table === "graphs") {
+          let selectedFields = "";
+          return {
+            select(fields?: string, options?: { head?: boolean; count?: string }) {
+              selectedFields = fields ?? "";
+              if (options?.head) {
+                return Promise.resolve({ data: [], error: null });
+              }
+              return this;
+            },
+            eq() {
+              return this;
+            },
+            order() {
+              return this;
+            },
+            limit() {
+              return graphsQuery();
+            },
+            insert(value: Record<string, unknown>) {
+              inserted.graphs.push(value);
+              return Promise.resolve({ data: null, error: null });
+            },
+            then<TResult1 = unknown, TResult2 = never>(
+              onfulfilled?:
+                | ((value: { data: unknown[]; error: null }) => TResult1 | PromiseLike<TResult1>)
+                | null,
+              onrejected?:
+                | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+                | null,
+            ) {
+              return Promise.resolve({
+                data: selectedFields === "version" ? [{ version: 1 }] : [],
+                error: null,
+              }).then(onfulfilled, onrejected);
+            },
+          };
+        }
+
+        if (table === "nodes") {
+          let selectedFields = "";
+          return {
+            select(fields?: string, options?: { head?: boolean; count?: string }) {
+              selectedFields = fields ?? "";
+              if (options?.head) {
+                if (selectedFields.includes("lesson_status")) {
+                  return Promise.resolve({
+                    data: null,
+                    error: {
+                      message:
+                        "Could not find the 'lesson_status' column of 'nodes' in the schema cache",
+                    },
+                  });
+                }
+                return Promise.resolve({ data: [], error: null });
+              }
+              return this;
+            },
+            limit() {
+              return Promise.resolve({ data: [], error: null });
+            },
+            insert(value: Array<Record<string, unknown>> | Record<string, unknown>) {
+              inserted.nodes.push(...(Array.isArray(value) ? value : [value]));
+              return Promise.resolve({ data: null, error: null });
+            },
+          };
+        }
+
+        if (table === "edges") {
+          return {
+            select(fields?: string, options?: { head?: boolean; count?: string }) {
+              if (options?.head) {
+                return Promise.resolve({ data: [], error: null });
+              }
+              return this;
+            },
+            limit() {
+              return Promise.resolve({ data: [], error: null });
+            },
+            insert(value: Array<Record<string, unknown>> | Record<string, unknown>) {
+              inserted.edges.push(...(Array.isArray(value) ? value : [value]));
+              return Promise.resolve({ data: null, error: null });
+            },
+          };
+        }
+
+        throw new Error(`Unexpected table access: ${table}`);
+      }),
+      rpc,
+    };
+
+    const result = await storeGeneratedGraph(
+      {
+        graph: baseGraph,
+        nodes: buildTestGraphNodes(),
+        edges: buildTestGraphEdges(),
+      },
+      undefined,
+      {
+        precomputedEmbedding: new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)),
+        findExactDuplicateCandidates: async () => [],
+        searchRetrievalCandidates: async () => [],
+        createUuid: vi
+          .fn()
+          .mockImplementation(() => randomUUID())
+          .mockReturnValueOnce(graphId),
+        createServiceClient: () => serviceClient as never,
+      },
+    );
+
+    expect(result.graph_id).toBe(graphId);
+    expect(
+      inserted.nodes.every(
+        (node) => !Object.prototype.hasOwnProperty.call(node, "lesson_status"),
+      ),
+    ).toBe(true);
   });
 
   it("rejects restricted p5 code before persistence", async () => {
@@ -268,6 +959,7 @@ describe("store helpers", () => {
           precomputedEmbedding: new Array(1536).fill(0).map((_, index) =>
             index === 0 ? 1 : 0,
           ),
+          findExactDuplicateCandidates: async () => [],
           searchRetrievalCandidates: async () => [],
           createServiceClient: () => serviceClient as never,
         },

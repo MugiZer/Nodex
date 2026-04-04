@@ -52,7 +52,7 @@ If the prompt does not fit any domain-specific subject above, use `general`.
 - Must be lowercase
 - Must use underscores only
 - Must contain no spaces, no hyphens, and no capitals
-- Must be scoped to a knowledge graph of roughly 10 to 25 nodes
+- Must be scoped to a knowledge graph of roughly 4 to 25 nodes
 - Must not be so granular that it becomes a single formula
 - Must not be so broad that it becomes an entire discipline
 
@@ -171,6 +171,8 @@ The current validation contract in `AGENTS.md` is:
 12. The rendered public `description` must satisfy the four-sentence contract
 13. If normalization still leaves the draft invalid, issue one targeted repair call using the original prompt, invalid draft, validation failures, and any active grounded candidate set, then fail descriptively if that repair also fails
 14. Downstream graph orchestration may thread `prerequisites` and `downstream_topics` as boundary-only metadata when available; those fields are used directly for deterministic boundary checks instead of reparsing the rendered description
+15. The canonicalize repair prompt must restate the same supported-subject enum, level enum, and semantic field-count constraints enforced by the server; repair is not allowed to operate on a looser contract than draft generation
+16. Live `POST /api/generate` may fall back to a deterministic canonicalization after a draft timeout plus invalid repair output, but the dedicated canonicalize route stays strict and must still fail descriptively on the same invalid repair
 
 Additional source caveat:
 
@@ -206,7 +208,7 @@ Required node fields:
 
 ### Node Rules
 
-- The graph must contain between 10 and 25 nodes
+- The graph must contain between 4 and 25 nodes
 - Every node must be atomic
 - If a concept contains two distinct ideas, split it into two nodes
 - Every node must be necessary
@@ -276,7 +278,7 @@ Examples from the source:
 
 The model output is machine-validated against these invariants:
 
-1. Node count is between 10 and 25
+1. Node count is between 4 and 25
 2. All node ids are unique
 3. All node positions are non-negative integers
 4. At least one node has position 0
@@ -357,7 +359,7 @@ The example is useful because it shows:
 The current server-side validation contract is:
 
 1. JSON parses without error
-2. `nodes` is an array with length between 10 and 25
+2. `nodes` is an array with length between 4 and 25
 3. Every node has `id`, `title`, and `position`
 4. All node ids are unique
 5. At least one node has position 0
