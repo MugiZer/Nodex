@@ -1,179 +1,122 @@
 # Nodex
 
-Nodex is an adaptive learning platform that turns a learner prompt into a structured knowledge graph, enriches that graph with lessons and diagnostics, and lets the learner progress through an interactive path of concepts.
+An adaptive learning platform that diagnoses the exact gaps in your foundation and builds a personalized path to mastery.
 
-## What It Does
+Built solo, as a high schooler, at the Claude Builders Club × McGill Hackathon, competing against teams of McGill university students.
 
-Nodex takes a topic request like:
+## The Problem
 
-- `I want to learn calculus`
-- `teach me differential equations`
-- `help me understand Gaussian random variables`
+Self-learners don't fail because the material is too hard. They fail because they have holes in their prerequisites and no way to find them.
 
-and turns it into:
+Structured curricula can't diagnose your specific gaps. You end up grinding through entire courses for the three concepts you actually need.
 
-- a canonicalized subject/topic/description
-- a retrieved existing graph when one already fits
-- otherwise a newly generated knowledge graph
-- node-level lessons, diagnostics, and visuals
-- a learner experience that unlocks the next step as progress is made
+Tutors solve this perfectly. They know the full dependency chain, spot exactly where you break down, and route you through the minimum path. But they cost $50-100/hr and don't scale.
 
-## Core Flow
+## The Thesis
 
-1. The user enters a prompt on the landing page.
-2. The system canonicalizes the request into a normalized learning topic.
-3. It checks whether an existing graph already matches the topic.
-4. If not, it generates a new graph.
-5. The graph is stored in Supabase.
-6. The first lesson slice is enriched in the background.
-7. The learner completes an adaptive diagnostic.
-8. The graph page shows available nodes.
-9. The learner opens a node, studies the lesson, and completes the quiz.
-10. Progress unlocks the next nodes.
+Every concept has a dependency chain, a directed acyclic graph of prerequisites. If you map that graph and diagnose where a learner breaks down, you can generate a minimal, personalized learning path from their gaps to their goal, skipping everything they already know.
 
-## Main Product Ideas
+Each node teaches exactly what's needed to unlock the next. Mastery is enforced through quizzes so no one advances on shaky ground.
 
-### Adaptive diagnostics
-The diagnostic places a learner into the graph at an appropriate starting point based on prerequisite knowledge gaps.
+Once a graph is generated, it's stored. One generation cost, unlimited distribution. You explain a concept the way a tutor would, then distribute a personalized version of it to anyone for nearly free.
 
-### Knowledge graph navigation
-The learner sees concepts as connected nodes, with progression controlled by hard prerequisites.
+## How It Works
 
-### Lessons and visuals
+1. **Prompt.** The learner types what they want to learn: "I want to learn calculus", "teach me differential equations", etc.
+
+2. **Canonicalization.** The system normalizes the request into a structured `{ subject, topic, description }` triple, so different phrasings of the same topic resolve to the same stored graph.
+
+3. **Graph retrieval or generation.** Supabase is checked for an existing graph. If none exists, Claude generates a new DAG of concept nodes and prerequisite edges, then stores it for all future learners.
+
+4. **Adaptive diagnostic.** A diagnostic assessment identifies which prerequisites the learner already knows and which they don't, placing them at the right starting point.
+
+5. **Node-by-node progression.** Each node contains a lesson. Advancement requires passing the quiz. Downstream nodes stay locked until prerequisites are proven.
+
+6. **Background enrichment.** Lessons, quizzes, diagrams, and interactive visuals are generated asynchronously. The learner can start immediately while deeper content is still being built.
+
+## Architecture
+
+### Canonicalization Layer
+
+User prompts are freeform and messy. The canonicalization layer normalizes them into a deterministic `{ subject, topic, description }` triple so that "teach me calc", "I want to learn calculus", and "help me with introductory calculus" all resolve to the same graph.
+
+### Graph Engine
+
+The core data structure is a directed acyclic graph where each node is a concept (e.g. "limits", "chain rule"), each edge is a hard prerequisite dependency, and the graph is topologically sorted to guarantee a valid learning order.
+
+Graphs are generated via Claude when no match exists in the database, then persisted to Supabase. The generation pipeline is fail-soft: partial graphs are repairable rather than discarded.
+
+Layout is handled by Dagre (automatic DAG layout) and React Flow (interactive graph visualization), giving learners a zoomable, pannable view of their learning path with clear visual state for locked, available, and completed nodes.
+
+### Adaptive Diagnostic System
+
+The diagnostic isn't a generic placement test. It's generated from the prerequisite structure of the specific graph the learner is entering. Questions target prerequisite nodes to find the exact frontier of the learner's knowledge.
+
+Diagnostic state is preserved across sessions so returning learners don't retake it.
+
+### Node Enrichment Pipeline
+
 Each node can carry:
-- lesson text
-- quiz content
-- a visual fallback or interactive sketch
-- prerequisite-specific lesson content when needed
+- Lesson text written in the context of its prerequisites
+- A quiz that gates progression to dependent nodes
+- A static diagram or p5.js interactive visualization
+- Prerequisite-specific supplementary content
 
-### Progress tracking
-Progress is stored per learner, per node, per graph version.
+Enrichment runs asynchronously after graph creation. The learner flow stays intact even if a visual or enrichment step hasn't finished or fails.
 
-## Current Implementation Themes
+### Progress and State
 
-The app is optimized for demo reliability and clarity:
-- canonicalization is deterministic where possible
-- graph generation is repairable and fail-soft
-- prerequisite diagnostics are preserved and rehydrated
-- lesson routes are server-resolvable
-- prerequisite node ids are normalized so encoded route params do not break navigation
+Progress is keyed by `{ user_id, node_id, graph_version }` and stored in Supabase. Progress survives browser refreshes and device switches. Graph versioning lets the underlying graph evolve without breaking existing learner state. Prerequisite node IDs are normalized consistently across URLs, client state, and server resolvers.
+
+### Route Architecture
+
+Lesson pages are server-resolvable. The client doesn't need to reconstruct which lesson to display from client-side state. Route handlers are typed and wrapped in try/catch with structured error responses. Early iterations used client-side lesson resolution from URL params, but encoded prerequisite node IDs would break navigation in edge cases, so I moved it server-side.
 
 ## Tech Stack
 
-- Next.js
-- React
-- TypeScript
-- Supabase
-- Tailwind CSS
-- React Flow
-- Dagre
-- Claude-powered generation stages
-
-## Important Contracts
-
-### Canonicalization
-A user prompt becomes a structured learning topic with:
-- `subject`
-- `topic`
-- `description`
-
-### Graph generation
-A graph is a directed dependency structure of:
-- `nodes`
-- `edges`
-
-### Node enrichment
-Nodes can be enriched with:
-- `lesson_text`
-- `quiz_json`
-- `static_diagram`
-- `diagnostic_questions`
-- `p5_code`
-- `visual_verified`
-
-### Progress
-Progress is keyed by:
-- `user_id`
-- `node_id`
-- `graph_version`
-
-## Demo Behavior
-
-For the live demo path, the system is designed to:
-- show a polished landing page
-- produce a usable graph for multiple subjects
-- ensure diagnostic flow is visible and required
-- make at least one node available early
-- avoid brittle client-only lesson resolution
-- keep the learner moving even when some enrichment is still in flight
+| Layer | Technology |
+|---|---|
+| Framework | Next.js (App Router) |
+| UI | React, Tailwind CSS |
+| Language | TypeScript |
+| Database | Supabase |
+| Graph layout | Dagre |
+| Graph rendering | React Flow |
+| AI generation | Claude API |
+| Interactive visuals | p5.js |
 
 ## Repository Structure
 
-Commonly relevant areas:
+```
+app/            → Next.js routes and pages
+components/     → UI for landing, graph, diagnostic, and lesson views
+lib/            → Shared logic, schemas, server helpers, session utilities
+context/        → Contract documentation (source of truth)
+tests/          → Regression and integration tests
+scripts/        → Preflight, smoke, and maintenance scripts
+```
 
-- `app/` - Next.js routes and pages
-- `components/` - UI components for landing, graph, diagnostic, and lesson views
-- `lib/` - shared logic, schemas, server helpers, and session utilities
-- `context/` - authoritative contract documentation
-- `tests/` - regression and integration coverage
-- `scripts/` - preflight, smoke, and maintenance scripts
+## Key Design Decisions
 
-## Development Notes
+**Why a DAG and not a linear curriculum?**
+Learning isn't linear. A single concept can have multiple independent prerequisites, and one prerequisite can unlock multiple downstream concepts. A DAG captures this naturally and lets learners skip branches they already know.
 
-This repo has a few important implementation rules:
+**Why enforce mastery at each node?**
+The whole thesis breaks if learners advance without understanding. Quizzes are the mechanism that prevents the same prerequisite gaps the product exists to solve.
 
-- `context/*` is the source of truth for contracts
-- keep route handlers typed and wrapped in `try/catch`
-- do not return bare 500s
-- keep learner flow intact even if a visual or enrichment step fails
-- prerequisite node ids must be treated consistently across URL, client state, and server resolvers
+**Why store graphs?**
+Graph generation is the most expensive operation (multiple Claude API calls). Storing the result means every subsequent learner who wants the same topic gets it instantly.
 
-## What To Expect In Practice
+**Why server-resolved lessons?**
+Client-side lesson resolution from URL params was fragile. Encoded prerequisite node IDs would break navigation. Moving it to the server eliminated an entire class of bugs.
 
-You should expect:
-- a polished landing page
-- a prompt-to-graph generation flow
-- a diagnostic step before graph exploration for new learners
-- a graph with active lessons and locked concepts
-- lesson pages that open from the graph side panel
-- progress that unlocks the next concept once the quiz is passed
+## Development
 
-## Current Demo Goal
+```bash
+npm install
+npm run dev
+npm test
+```
 
-The project is being shaped to make the demo feel:
-- calm
-- premium
-- intentional
-- educational
-- reliable enough for live judging
+Check `package.json` and `scripts/` for additional commands.
 
-## Notes For Contributors
-
-When changing behavior, update `context/*` first if the contract is changing.
-
-When fixing bugs, prioritize:
-- route contract consistency
-- deterministic node identity
-- durable server-backed state where browser state is too fragile
-- regression tests for any new failure mode
-
-## Local Scripts
-
-Depending on the current state of the repo, useful scripts may include:
-- lint
-- tests
-- DB preflight
-- smoke replay
-- demo prewarm
-
-Check `package.json` and `scripts/` for the current exact commands.
-
-## Short Version
-
-Nodex is an adaptive learning graph app that:
-- understands a learner’s request
-- builds or retrieves the right graph
-- enriches it with lessons and diagnostics
-- tracks learner progress
-- opens lessons reliably from the graph
-- keeps the demo path stable enough for live use
