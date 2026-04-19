@@ -1,3 +1,7 @@
+[![Watch the video](https://img.youtube.com/vi/f3QCvp00sCw/maxresdefault.jpg)](https://youtu.be/f3QCvp00sCw)
+
+> Click the image above to watch the video on YouTube
+
 # Nodex
 
 An adaptive learning platform that diagnoses the exact gaps in your foundation and builds a personalized path to mastery.
